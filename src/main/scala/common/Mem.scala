@@ -1,5 +1,6 @@
 /***************************************************************************************
 * Copyright (c) 2020-2023 Institute of Computing Technology, Chinese Academy of Sciences
+* Copyright (c) 2020-2021 Peng Cheng Laboratory
 *
 * DiffTest is licensed under Mulan PSL v2.
 * You can use this software according to the terms and conditions of the Mulan PSL v2.
@@ -15,240 +16,160 @@
 
 package difftest.common
 
-import chisel3._
-import chisel3.experimental.ExtModule
-import chisel3.util._
+import spinal.core._
 
-trait HasReadPort { this: ExtModule =>
-  val r = IO(new Bundle {
-    val enable = Input(Bool())
-    val index  = Input(UInt(64.W))
-    val data   = Output(UInt(64.W))
-  })
-
-  val r_dpic =
-    """
-      |import "DPI-C" function longint difftest_ram_read(input longint rIdx);
-      |""".stripMargin
-
-  val r_if =
-    """
-      |input             r_enable,
-      |input      [63:0] r_index,
-      |output reg [63:0] r_data,
-      |""".stripMargin
-
-  val r_func =
-    """
-      |if (r_enable) begin
-      |  r_data <= difftest_ram_read(r_index);
-      |end
-      |""".stripMargin
-
+trait HasReadPort { this: BlackBox =>
+  val r = new Bundle {
+    val enable = in Bool()
+    val index = in UInt(64 bits)
+    val data = out UInt(64 bits)
+  }
+  r.setName("r")
+  protected val readPorts = "input r_enable, input [63:0] r_index, output reg [63:0] r_data"
+  protected val readImport =
+    "import \"DPI-C\" function longint unsigned difftest_ram_read(input longint unsigned rIdx);"
+  protected val readCall = "if (r_enable) r_data <= difftest_ram_read(r_index);"
   def read(enable: Bool, index: UInt): UInt = {
     r.enable := enable
-    r.index  := index
+    r.index := index.resize(64)
     r.data
   }
 }
 
-
-trait HasWritePort { this: ExtModule =>
-  val w = IO(new Bundle {
-    val enable = Input(Bool())
-    val index  = Input(UInt(64.W))
-    val data   = Input(UInt(64.W))
-    val mask   = Input(UInt(64.W))
-  })
-
-  val w_dpic =
-    """
-      |import "DPI-C" function void difftest_ram_write
-      |(
-      |  input  longint index,
-      |  input  longint data,
-      |  input  longint mask
-      |);
-      |""".stripMargin
-
-  val w_if =
-    """
-      |input         w_enable,
-      |input  [63:0] w_index,
-      |input  [63:0] w_data,
-      |input  [63:0] w_mask,
-      |""".stripMargin
-
-  val w_func =
-    """
-      |if (w_enable) begin
-      |  difftest_ram_write(w_index, w_data, w_mask);
-      |end
-      |""".stripMargin
-
+trait HasWritePort { this: BlackBox =>
+  val w = new Bundle {
+    val enable = in Bool()
+    val index = in UInt(64 bits)
+    val data = in UInt(64 bits)
+    val mask = in UInt(64 bits)
+  }
+  w.setName("w")
+  protected val writePorts =
+    "input w_enable, input [63:0] w_index, input [63:0] w_data, input [63:0] w_mask"
+  protected val writeImport =
+    "import \"DPI-C\" function void difftest_ram_write(input longint unsigned index, " +
+      "input longint unsigned data, input longint unsigned mask);"
+  protected val writeCall = "if (w_enable) difftest_ram_write(w_index, w_data, w_mask);"
   def write(enable: Bool, index: UInt, data: UInt, mask: UInt): HasWritePort = {
     w.enable := enable
-    w.index  := index
-    w.data   := data
-    w.mask   := mask
+    w.index := index.resize(64)
+    w.data := data
+    w.mask := mask
     this
   }
 }
 
-class MemRHelper extends ExtModule with HasExtModuleInline with HasReadPort {
-  val clock  = IO(Input(Clock()))
-
-  setInline("MemRHelper.v",
-    s"""
-       |$r_dpic
-       |module MemRHelper(
-       |  $r_if
-       |  input clock
-       |);
-       |  always @(posedge clock) begin
-       |    $r_func
-       |  end
-       |endmodule
-     """.stripMargin)
+class MemRHelper extends BlackBox with HasReadPort {
+  val clock = in Bool()
+  mapClockDomain(clock = clock)
+  setInlineVerilog(s"""module MemRHelper($readPorts, input clock);
+  $readImport
+  always @(posedge clock) begin
+    $readCall
+  end
+endmodule
+""")
+}
+class MemWHelper extends BlackBox with HasWritePort {
+  val clock = in Bool()
+  mapClockDomain(clock = clock)
+  setInlineVerilog(s"""module MemWHelper($writePorts, input clock);
+  $writeImport
+  always @(posedge clock) begin
+    $writeCall
+  end
+endmodule
+""")
+}
+class MemRWHelper extends BlackBox with HasReadPort with HasWritePort {
+  val clock = in Bool()
+  val enable = in Bool()
+  mapClockDomain(clock = clock)
+  setInlineVerilog(s"""module MemRWHelper($readPorts, $writePorts, input enable, input clock);
+  $readImport
+  $writeImport
+  always @(posedge clock) begin
+    if (enable) begin
+      $readCall
+      $writeCall
+    end
+  end
+endmodule
+""")
 }
 
-class MemWHelper extends ExtModule with HasExtModuleInline with HasWritePort {
-  val clock  = IO(Input(Clock()))
-
-  setInline("MemWHelper.v",
-    s"""
-       |$w_dpic
-       |module MemWHelper(
-       |  $w_if
-       |  input clock
-       |);
-       |  always @(posedge clock) begin
-       |   $w_func
-       |  end
-       |endmodule
-     """.stripMargin)
-}
-
-class MemRWHelper extends ExtModule with HasExtModuleInline with HasReadPort with HasWritePort {
-  val clock  = IO(Input(Clock()))
-  val enable = IO(Input(Bool()))
-
-  setInline("MemRWHelper.v",
-    s"""
-       |$r_dpic
-       |$w_dpic
-       |module MemRWHelper(
-       |  $r_if
-       |  $w_if
-       |  input enable,
-       |  input clock
-       |);
-       |  always @(posedge clock) begin
-       |    if (enable) begin
-       |      $r_func
-       |      $w_func
-       |    end
-       |  end
-       |endmodule
-     """.stripMargin)
-}
-
-abstract class DifftestMem(size: BigInt, lanes: Int, bits: Int) extends Module {
-  require(bits == 8 && lanes % 8 == 0, "supports 64-bits aligned byte access only")
+// RAM's C++ API transports 64-bit words independently of the CPU's XLEN.
+abstract class DifftestMem(val size: BigInt, val lanes: Int, val bits: Int) extends Component {
+  require(size > 0)
+  require(bits == 8 && lanes > 0 && lanes % 8 == 0, "RAM DPI requires 64-bit aligned byte lanes")
   val n_helper = lanes / 8
-
-  val read = IO(new Bundle {
-    val valid = Input(Bool())
-    val index = Input(UInt(64.W))
-    val data  = Output(Vec(n_helper, UInt(64.W)))
-  })
-  val write = IO(Input(new Bundle {
-    val valid = Bool()
-    val index = UInt(64.W)
-    val data  = Vec(n_helper, UInt(64.W))
-    val mask  = Vec(n_helper, UInt(64.W))
-  }))
-
+  val read = new Bundle {
+    val valid = in Bool()
+    val index = in UInt(64 bits)
+    val data = out(Vec(UInt(64 bits), n_helper))
+  }
+  val write = new Bundle {
+    val valid = in Bool()
+    val index = in UInt(64 bits)
+    val data = in(Vec(UInt(64 bits), n_helper))
+    val mask = in(Vec(UInt(64 bits), n_helper))
+  }
   def read(addr: UInt): Vec[UInt] = {
     read.valid := !write.valid
-    read.index := addr
+    read.index := addr.resize(64)
     read.data
   }
-
   def readAndHold(addr: UInt, en: Bool): Vec[UInt] = {
     read.valid := en
-    read.index := addr
-    Mux(RegNext(en), read.data, RegEnable(read.data, RegNext(en))).asTypeOf(Vec(lanes, UInt(bits.W)))
+    read.index := addr.resize(64)
+    val responseValid = RegNext(en) init(False)
+    val held = RegNextWhen(read.data, responseValid)
+    held.foreach(_ init(0))
+    val bytes = Vec(UInt(bits bits), lanes)
+    bytes.assignFromBits(Mux(responseValid, read.data, held).asBits)
+    bytes
   }
-
-  def write(addr: UInt, data: Seq[UInt], mask: Seq[Bool]): Unit = {
-    write.valid := true.B
-    write.index := addr
-    write.data  := VecInit(data).asTypeOf(write.data)
-    require(data.length == lanes, s"data Vec[UInt] should have the length of $lanes")
-    require(mask.length == lanes, s"mask Vec[Bool] should have the length of $lanes")
-    require(data.head.getWidth == bits, s"data should have the width of $bits")
-    write.mask  := VecInit(mask.map(m => Fill(bits, m))).asTypeOf(write.mask)
+  def write(addr: UInt, data: scala.collection.Seq[UInt], mask: scala.collection.Seq[Bool]): Unit = {
+    require(data.length == lanes && data.forall(_.getWidth == bits))
+    require(mask.length == lanes)
+    write.valid := True
+    write.index := addr.resize(64)
+    write.data.assignFromBits(Vec(data.toSeq).asBits)
+    write.mask.assignFromBits(Vec(mask.toSeq.map(m => Mux(m, B(255, 8 bits), B(0, 8 bits)))).asBits)
   }
 }
 
 class DifftestMem1P(size: BigInt, lanes: Int, bits: Int) extends DifftestMem(size, lanes, bits) {
-  assert(!read.valid || !write.valid, "read and write come at the same cycle")
-
-  val helper = Seq.fill(n_helper)(Module(new MemRWHelper))
-  read.data := helper.zipWithIndex.map{ case (h, i) =>
-    h.clock := clock
-    h.enable := !reset.asBool
-    h.write(
-      enable = write.valid,
-      index  = write.index * n_helper.U + i.U,
-      data   = write.data(i),
-      mask   = write.mask(i)
-    )
-    h.read(
-      enable = read.valid,
-      index  = read.index * n_helper.U + i.U
-    )
+  when(!ClockDomain.current.isResetActive) {
+    assert(!read.valid || !write.valid, "read and write in the same single-port cycle")
+  }
+  for (i <- 0 until n_helper) {
+    val helper = new MemRWHelper
+    helper.enable := !ClockDomain.current.isResetActive
+    helper.write(write.valid, (write.index * n_helper + i).resize(64), write.data(i), write.mask(i))
+    read.data(i) := helper.read(read.valid, (read.index * n_helper + i).resize(64))
   }
 }
-
 class DifftestMem2P(size: BigInt, lanes: Int, bits: Int) extends DifftestMem(size, lanes, bits) {
-  val r_helper = Seq.fill(n_helper)(Module(new MemRHelper))
-  read.data := r_helper.zipWithIndex.map{ case (h, i) =>
-    h.clock  := clock
-    h.read(
-      enable = !reset.asBool && read.valid,
-      index  = read.index * n_helper.U + i.U
-    )
-  }
-
-  val w_helper = Seq.fill(n_helper)(Module(new MemWHelper))
-  w_helper.zipWithIndex.foreach { case (h, i) =>
-    h.clock  := clock
-    h.write(
-      enable = !reset.asBool && write.valid,
-      index  = write.index * n_helper.U + i.U,
-      data   = write.data(i),
-      mask   = write.mask(i)
-    )
+  for (i <- 0 until n_helper) {
+    val reader = new MemRHelper
+    read.data(i) := reader.read(!ClockDomain.current.isResetActive && read.valid,
+      (read.index * n_helper + i).resize(64))
+    val writer = new MemWHelper
+    writer.write(!ClockDomain.current.isResetActive && write.valid,
+      (write.index * n_helper + i).resize(64), write.data(i), write.mask(i))
   }
 }
-
 object DifftestMem {
-  def apply(size: BigInt, beatBytes: Int): DifftestMem = {
-    apply(size, beatBytes, 8)
-  }
-
+  def apply(size: BigInt, beatBytes: Int): DifftestMem = apply(size, beatBytes, 8)
   def apply(size: BigInt, lanes: Int, bits: Int, singlePort: Boolean = true): DifftestMem = {
-    val mod = if (singlePort) {
-      Module(new DifftestMem1P(size, lanes, bits))
-    } else {
-      Module(new DifftestMem2P(size, lanes, bits))
-    }
-    mod.read        := DontCare
-    mod.read.valid  := false.B
-    mod.write       := DontCare
-    mod.write.valid := false.B
-    mod
+    val memory = if (singlePort) new DifftestMem1P(size, lanes, bits) else new DifftestMem2P(size, lanes, bits)
+    memory.read.valid := False
+    memory.read.index := 0
+    memory.write.assignFromBits(B(0, memory.write.getBitsWidth bits))
+    memory.read.valid.allowOverride()
+    memory.read.index.allowOverride()
+    memory.write.allowOverride()
+    memory
   }
 }

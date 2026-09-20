@@ -35,9 +35,14 @@ $(SIM_TOP_V): $(DIFF_SCALA_FILE) $(SCALA_FILE)
 # build simulation top verilog
 sim-verilog: $(SIM_TOP_V)
 
-# generate difftest files for non-chisel design.
+# Generate standalone probes and matching C++ interfaces.
+SBT ?= sbt
+XLEN ?= 64
+FLEN ?= 64
+VLEN ?= 128
+NUM_PHY_REGS ?= 32
 difftest_verilog:
-	mill difftest.runMain difftest.DifftestMain -td $(BUILD_DIR)
+	$(SBT) "runMain difftest.DifftestMain --target-dir $(BUILD_DIR) --xlen $(XLEN) --flen $(FLEN) --vlen $(VLEN) --num-phy-regs $(NUM_PHY_REGS) --num-cores $(NUM_CORES)"
 
 # co-simulation with DRAMsim3
 ifeq ($(WITH_DRAMSIM3),1)
@@ -60,7 +65,7 @@ SIM_CXXFILES = $(shell find $(SIM_CSRC_DIR) -name "*.cpp")
 
 # generated-src
 GEN_CSRC_DIR = $(BUILD_DIR)/generated-src
-GEN_CXXFILES = $(shell find $(GEN_CSRC_DIR) -name "*.cpp")
+GEN_CXXFILES = $(shell find $(GEN_CSRC_DIR) -name "*.cpp" 2>/dev/null)
 
 DIFFTEST_CSRC_DIR = $(abspath ./src/test/csrc/difftest)
 DIFFTEST_CXXFILES = $(shell find $(DIFFTEST_CSRC_DIR) -name "*.cpp")

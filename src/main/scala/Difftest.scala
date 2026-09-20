@@ -16,543 +16,234 @@
 
 package difftest
 
-import chisel3._
-import chisel3.util._
+import spinal.core._
 import difftest.dpic.DPIC
-
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Paths}
-import scala.collection.mutable.ListBuffer
+import scala.collection.mutable
 
-trait DifftestWithCoreid {
-  val coreid = UInt(8.W)
+private[difftest] object Widths {
+  def checkXlen(xlen: Int): Unit =
+    require(xlen == 32 || xlen == 64, "xlen/flen must be 32 or 64")
+  def storageBits(width: Int): Int = {
+    require(width > 0 && width <= 64, s"DPI scalar width must be in 1..64, got $width")
+    Seq(8, 16, 32, 64).find(_ >= width).get
+  }
 }
 
-trait DifftestWithIndex {
-  val index = UInt(8.W)
-}
-
-trait DifftestWithValid {
-  val valid = Bool()
-}
-
+trait DifftestWithCoreid { def coreid: UInt }
+trait DifftestWithIndex { def index: UInt }
+trait DifftestWithValid { def valid: Bool }
 trait DifftestWithAddress { this: DifftestWithValid =>
   val numElements: Int
-  val needFlatten: Boolean = false
-
-  val address = UInt(log2Ceil(numElements).W)
+  def needFlatten: Boolean = false
+  def address: UInt
 }
 
-abstract class DifftestBundle extends Bundle
-  with DifftestWithCoreid {
-  // Used to detect the number of cores. Must be used only by one Bundle.
+private[difftest] case class DiffField(name: String, values: Seq[BaseType], vector: Boolean) {
+  require(values.nonEmpty, s"Empty field $name")
+  val width: Int = values.head.getBitsWidth
+  require(values.forall(_.getBitsWidth == width), s"Non-uniform field $name")
+  val storage: Int = Widths.storageBits(width)
+  def cppType: String = s"uint${storage}_t"
+  def cppDeclaration: String = s"  $cppType $name${if (vector) s"[${values.size}]" else ""};"
+  def ports: Seq[(String, String, Int)] = values.indices.map { i =>
+    (s"io_$name${if (vector) s"_$i" else ""}", if (vector) s"$name[$i]" else name, width)
+  }
+}
+
+abstract class DifftestBundle(addressElements: Int = 0) extends Bundle with DifftestWithCoreid {
+  // Declare hardware in the Bundle so Spinal includes it in naming and cloning.
+  val coreid = UInt(8 bits)
+  val index = isIndexed generate UInt(8 bits)
+  val valid = withValid generate Bool()
+  val address = (this.isInstanceOf[DifftestWithAddress]) generate {
+    require(addressElements > 0)
+    UInt((log2Up(addressElements) max 1) bits)
+  }
   def isUniqueIdentifier: Boolean = false
-  // A desired offset in the C++ struct can be specified.
-  val desiredOffset: Int = 999
-
+  def desiredOffset: Int = 999
   val desiredCppName: String
-  def desiredModuleName: String = {
-    val className = this.getClass.getName.replace("$", ".").replace("Diff", "Difftest")
-    className.split("\\.").filterNot(_.forall(java.lang.Character.isDigit)).last
-  }
-
+  def desiredModuleName: String = getClass.getSimpleName.replaceFirst("^Diff", "Difftest")
   def order: (Int, String) = (desiredOffset, desiredModuleName)
-
   def isIndexed: Boolean = this.isInstanceOf[DifftestWithIndex]
-  def getIndex: Option[UInt] = {
-    this match {
-      case b: DifftestWithIndex => Some(b.index)
-      case _ => None
-    }
+  def getIndex: Option[UInt] = this match {
+    case b: DifftestWithIndex => Some(b.index)
+    case _ => None
   }
-
   def withValid: Boolean = this.isInstanceOf[DifftestWithValid]
-  def getValid: Bool = {
-    this match {
-      case b: DifftestWithValid => b.valid
-      case _ => true.B
-    }
+  def getValid: Bool = this match {
+    case b: DifftestWithValid => b.valid
+    case _ => True
   }
-  def isFlatten: Boolean = this.isInstanceOf[DifftestWithAddress] &&
-    this.asInstanceOf[DifftestWithAddress].needFlatten
+  def isFlatten: Boolean = this match {
+    case b: DifftestWithAddress => b.needFlatten
+    case _ => false
+  }
   def numFlattenElements: Int = this.asInstanceOf[DifftestWithAddress].numElements
-
-  // Elements without clock, coreid, and index.
-  def diffElements: Seq[(String, Seq[UInt])] = {
-    val filteredElements = Seq("clock", "coreid", "index")
-    val raw = elements.toSeq.reverse.filterNot(e => filteredElements.contains(e._1))
-    raw.map{ case (s, data) =>
-      data match {
-        case v: Vec[_] => (s, Some(v.asInstanceOf[Vec[UInt]]))
-        case u: UInt => (s, Some(Seq(u)))
-        case _ => println(s"Unknown type: ($s, $data)")
-          (s, None)
-      }
-    }.map(x => (x._1, x._2.get))
+  private[difftest] def fields: Seq[DiffField] = elements.toSeq.map {
+    case (name, base: BaseType) => DiffField(name, Seq(base), vector = false)
+    case (name, vec: Vec[_]) => DiffField(name, vec.toSeq.map {
+      case base: BaseType => base
+      case _ => throw new IllegalArgumentException(s"Unsupported nested field $name")
+    }, vector = true)
+    case (name, _) => throw new IllegalArgumentException(s"Unsupported field $name")
   }
-  // Sizes of the DiffTest elements.
-  private def diffSizes(round: Int): Seq[Seq[Int]] = {
-    diffElements.map(_._2.map(u => (u.getWidth + round - 1) / round))
+  private[difftest] def stateFields: Seq[DiffField] = fields.filterNot { f =>
+    Set("coreid", "index").contains(f.name) ||
+      (isFlatten && Set("valid", "address").contains(f.name))
   }
-
+  def diffElements: Seq[(String, Seq[BaseType])] =
+    fields.filterNot(f => Set("coreid", "index").contains(f.name)).map(f => f.name -> f.values)
   def diffBytes(aligned: Int = 8): Seq[UInt] = {
-    val sizes = diffSizes(aligned)
-    diffElements.map(_._2).zip(sizes).flatMap{ case (elem, size) =>
-      elem.zip(size).flatMap { case (e, s) =>
-        (0 until s).map(i => {
-          val msb = Seq(i * aligned + aligned - 1, e.getWidth - 1).min
-          e(msb, i * aligned)
-        })
+    require(aligned > 0)
+    diffElements.flatMap(_._2).flatMap { value =>
+      val bits = value.asBits
+      (0 until bits.getWidth by aligned).map { offset =>
+        bits((offset + aligned - 1) min (bits.getWidth - 1) downto offset).asUInt
       }
     }
   }
-
-  // Size of this DiffTest Bundle.
-  def size(round: Int): Int = diffSizes(round).map(_.sum).sum
-  // Byte size of this DiffTest Bundle.
+  def size(round: Int): Int = {
+    require(round > 0)
+    diffElements.flatMap(_._2).map(v => (v.getBitsWidth + round - 1) / round).sum
+  }
   def byteSize: Int = size(8)
-
-  def toCppDeclMacro: String = {
-    val macroName = s"CONFIG_DIFFTEST_${desiredModuleName.toUpperCase.replace("DIFFTEST", "")}"
-    s"#define $macroName"
-  }
-  def toCppDeclaration: String = {
-    val cpp = ListBuffer.empty[String]
-    cpp += "typedef struct {"
-    for (((name, elem), size) <- diffElements.zip(diffSizes(8))) {
-      val isRemoved = isFlatten && Seq("valid", "address").contains(name)
-      if (!isRemoved) {
-        val arrayType = s"uint${size.head * 8}_t"
-        val arrayWidth = if (elem.length == 1) "" else s"[${elem.length}]"
-        cpp += f"  $arrayType%-8s $name$arrayWidth;"
-      }
-    }
-    cpp += s"} ${desiredModuleName};"
-    cpp.mkString("\n")
-  }
+  def toCppDeclMacro: String =
+    s"#define CONFIG_DIFFTEST_${desiredModuleName.stripPrefix("Difftest").toUpperCase}"
+  def toCppDeclaration: String =
+    (Seq("typedef struct {") ++ stateFields.map(_.cppDeclaration) ++ Seq(s"} $desiredModuleName;")).mkString("\n")
 }
 
-class DiffArchEvent extends DifftestBundle
-  with DifftestWithValid
-{
-  val interrupt     = UInt(32.W)
-  val exception     = UInt(32.W)
-  val exceptionPC   = UInt(64.W)
-  val exceptionInst = UInt(32.W)
-
-  // DiffArchEvent must be instantiated once for each core.
-  override def isUniqueIdentifier: Boolean = true
-  override val desiredCppName: String = "event"
-}
-
-class DiffInstrCommit(numPhyRegs: Int = 32) extends DifftestBundle
-  with DifftestWithIndex
-  with DifftestWithValid
-{
-  val skip     = Bool()
-  val isRVC    = Bool()
-  val rfwen    = Bool()
-  val fpwen    = Bool()
-  val vecwen   = Bool()
-  val wpdest   = UInt(log2Ceil(numPhyRegs).W)
-  val wdest    = UInt(8.W)
-
-  val pc       = UInt(64.W)
-  val instr    = UInt(32.W)
-  val robIdx   = UInt(10.W)
-  val lqIdx    = UInt(7.W)
-  val sqIdx    = UInt(7.W)
-  val isLoad   = Bool()
-  val isStore  = Bool()
-  val nFused   = UInt(8.W)
-  val special  = UInt(8.W)
-
-  def setSpecial(
-    isDelayedWb: Bool = false.B,
-    isExit: Bool = false.B,
-  ): Unit = {
-    special := Cat(isExit, isDelayedWb)
-  }
-  override val desiredCppName: String = "commit"
-}
-
-class DiffTrapEvent extends DifftestBundle {
-  val hasTrap  = Bool()
-  val cycleCnt = UInt(64.W)
-  val instrCnt = UInt(64.W)
-  val hasWFI   = Bool()
-
-  val code     = UInt(3.W)
-  val pc       = UInt(64.W)
-
-  override val desiredCppName: String = "trap"
-}
-
-class DiffCSRState extends DifftestBundle {
-  val priviledgeMode = UInt(64.W)
-  val mstatus = UInt(64.W)
-  val sstatus = UInt(64.W)
-  val mepc = UInt(64.W)
-  val sepc = UInt(64.W)
-  val mtval = UInt(64.W)
-  val stval = UInt(64.W)
-  val mtvec = UInt(64.W)
-  val stvec = UInt(64.W)
-  val mcause = UInt(64.W)
-  val scause = UInt(64.W)
-  val satp = UInt(64.W)
-  val mip = UInt(64.W)
-  val mie = UInt(64.W)
-  val mscratch = UInt(64.W)
-  val sscratch = UInt(64.W)
-  val mideleg = UInt(64.W)
-  val medeleg = UInt(64.W)
-  override val desiredCppName: String = "csr"
-  override val desiredOffset: Int = 1
-}
-
-class DiffDebugMode extends DifftestBundle {
-  val debugMode = Bool()
-  val dcsr = UInt(64.W)
-  val dpc = UInt(64.W)
-  val dscratch0 = UInt(64.W)
-  val dscratch1 = UInt(64.W)
-  override val desiredCppName: String = "dmregs"
-}
-
-class DiffIntWriteback(val numElements: Int = 32) extends DifftestBundle
-  with DifftestWithValid
-  with DifftestWithAddress
-{
-  val data  = UInt(64.W)
-  override val desiredCppName: String = "wb_int"
-  override val needFlatten: Boolean = true
-}
-
-class DiffFpWriteback(numElements: Int = 32) extends DiffIntWriteback(numElements) {
-  override val desiredCppName: String = "wb_fp"
-}
-
-class DiffArchIntRegState extends DifftestBundle {
-  val value = Vec(32, UInt(64.W))
-  override val desiredCppName: String = "regs_int"
-  override val desiredOffset: Int = 0
-}
-
-abstract class DiffArchDelayedUpdate(val numElements: Int = 32) extends DifftestBundle
-  with DifftestWithIndex
-  with DifftestWithValid
-  with DifftestWithAddress
-{
-  val data = UInt(64.W)
-  val nack = Bool()
-}
-
-class DiffArchIntDelayedUpdate extends DiffArchDelayedUpdate {
-  override val desiredCppName: String = "regs_int_delayed"
-}
-
-class DiffArchFpDelayedUpdate extends DiffArchDelayedUpdate {
-  override val desiredCppName: String = "regs_fp_delayed"
-}
-
-class DiffArchFpRegState extends DifftestBundle {
-  val value = Vec(32, UInt(64.W))
-  override val desiredCppName: String = "regs_fp"
-  override val desiredOffset: Int = 2
-}
-
-class DiffArchVecRegState extends DifftestBundle {
-  val value = Vec(64, UInt(64.W))
-  override val desiredCppName: String = "regs_vec"
-  override val desiredOffset: Int = 4
-}
-
-class DiffVecCSRState extends DifftestBundle {
-  val vstart = UInt(64.W)
-  val vxsat  = UInt(64.W)
-  val vxrm   = UInt(64.W)
-  val vcsr   = UInt(64.W)
-  val vl     = UInt(64.W)
-  val vtype  = UInt(64.W)
-  val vlenb  = UInt(64.W)
-  override val desiredCppName: String = "vcsr"
-  override val desiredOffset: Int = 5
-}
-
-class DiffSbufferEvent extends DifftestBundle
-  with DifftestWithIndex
-  with DifftestWithValid
-{
-  val addr = UInt(64.W)
-  val data = Vec(64, UInt(8.W))
-  val mask = UInt(64.W)
-  override val desiredCppName: String = "sbuffer"
-}
-
-class DiffStoreEvent extends DifftestBundle
-  with DifftestWithIndex
-  with DifftestWithValid
-{
-  val addr   = UInt(64.W)
-  val data   = UInt(64.W)
-  val mask   = UInt(8.W)
-  override val desiredCppName: String = "store"
-}
-
-class DiffLoadEvent extends DifftestBundle
-  with DifftestWithIndex
-  with DifftestWithValid
-{
-  val paddr  = UInt(64.W)
-  val opType = UInt(8.W)
-  val fuType = UInt(8.W)
-  override val desiredCppName: String = "load"
-}
-
-class DiffAtomicEvent extends DifftestBundle
-  with DifftestWithValid
-{
-  val addr = UInt(64.W)
-  val data = UInt(64.W)
-  val mask = UInt(8.W)
-  val fuop = UInt(8.W)
-  val out  = UInt(64.W)
-  override val desiredCppName: String = "atomic"
-}
-
-class DiffL1TLBEvent extends DifftestBundle
-  with DifftestWithValid
-  with DifftestWithIndex
-{
-  val satp = UInt(64.W)
-  val vpn = UInt(64.W)
-  val ppn = UInt(64.W)
-  override val desiredCppName: String = "l1tlb"
-}
-
-class DiffL2TLBEvent extends DifftestBundle
-  with DifftestWithValid
-  with DifftestWithIndex
-{
-  val valididx = Vec(8, Bool())
-  val satp = UInt(64.W)
-  val vpn = UInt(64.W)
-  val ppn = Vec(8, UInt(64.W))
-  val perm = UInt(8.W)
-  val level = UInt(8.W)
-  val pf = Bool()
-  override val desiredCppName: String = "l2tlb"
-}
-
-class DiffRefillEvent extends DifftestBundle
-  with DifftestWithValid
-  with DifftestWithIndex
-{
-  val addr  = UInt(64.W)
-  val data  = Vec(8, UInt(64.W))
-  val idtfr = UInt(8.W) // identifier for flexible usage
-  override val desiredCppName: String = "refill"
-}
-
-class DiffLrScEvent extends DifftestBundle
-  with DifftestWithValid
-{
-  val success = Bool()
-  override val desiredCppName: String = "lrsc"
-}
-
-class DiffRunaheadEvent extends DifftestBundle
-  with DifftestWithIndex
-  with DifftestWithValid
-{
-  val branch        = Bool()
-  val may_replay    = Bool()
-  val pc            = UInt(64.W)
-  val checkpoint_id = UInt(64.W)
-  override val desiredCppName: String = "runahead"
-}
-
-class DiffRunaheadCommitEvent extends DifftestBundle
-  with DifftestWithIndex
-  with DifftestWithValid
-{
-  val pc            = UInt(64.W)
-  override val desiredCppName: String = "runahead_commit"
-}
-
-class DiffRunaheadRedirectEvent extends DifftestBundle
-  with DifftestWithValid
-{
-  val pc            = UInt(64.W) // for debug only
-  val target_pc     = UInt(64.W) // for debug only
-  val checkpoint_id = UInt(64.W)
-  override val desiredCppName: String = "runahead_redirect"
-}
-
-class DiffCoverage(
-  val desiredCppName: String,
-  val numElements: Int
-) extends DifftestBundle
-  with DifftestWithValid
-  with DifftestWithAddress
-{
-  val covered = Bool()
-  override val needFlatten: Boolean = true
-}
-
-trait DifftestModule[T <: DifftestBundle] {
-  val io: T
-}
+trait DifftestModule[T <: DifftestBundle] { val io: T }
 
 object DifftestModule {
-  private val instances = ListBuffer.empty[(DifftestBundle, String)]
-
-  def apply[T <: DifftestBundle](
-    gen:      T,
-    style:    String  = "dpic",
-    dontCare: Boolean = false,
-    delay:    Int     = 0,
-  ): T = {
-    val id = register(gen, style)
-    val difftest: T = Wire(gen)
-    val sink = style match {
-      // By default, use the DPI-C style.
-      case _ => DPIC(gen)
-    }
-    sink := Delayer(difftest, delay)
-    sink.coreid := difftest.coreid
-    if (dontCare) {
-      difftest := DontCare
-    }
-    difftest
+  private class Registry {
+    val instances = mutable.ArrayBuffer.empty[DifftestBundle]
+    val interfaces = mutable.LinkedHashMap.empty[String, (String, String)]
   }
-
-  def register[T <: DifftestBundle](gen: T, style: String): Int = {
-    val id = instances.length
-    val element = (gen, style)
-    instances += element
+  private def registry: Registry =
+    GlobalData.get.userDatabase.getOrElseUpdate(this, new Registry).asInstanceOf[Registry]
+  def apply[T <: DifftestBundle](gen: T, style: String = "dpic",
+                                dontCare: Boolean = false, delay: Int = 0): T = {
+    require(style == "dpic", s"Unsupported DiffTest backend: $style")
+    require(delay >= 0)
+    register(gen, style)
+    if (dontCare) {
+      gen.assignDontCare()
+      gen.allowOverride()
+    }
+    val sink = new DPIC(gen)
+    sink.io := Delayer(gen, delay)
+    when(ClockDomain.current.isResetActive) {
+      sink.io.elements.filterNot { case (name, _) => name == "coreid" || name == "index" }
+        .foreach { case (_, data) =>
+          data.flatten.foreach(field => field.assignFromBits(B(0, field.getBitsWidth bits)))
+        }
+      // Clear the correct slot even while its delayed index register is reset.
+      sink.io.getIndex.foreach(_ := gen.getIndex.get)
+    }
+    // A core's identity is not delayed or cleared by reset.
+    sink.io.coreid.allowOverride()
+    sink.io.coreid := gen.coreid
+    gen
+  }
+  def register[T <: DifftestBundle](gen: T, style: String = "dpic"): Int = {
+    require(style == "dpic", s"Unsupported DiffTest backend: $style")
+    registry.instances.find(_.desiredModuleName == gen.desiredModuleName).foreach { previous =>
+      require(previous.toCppDeclaration == gen.toCppDeclaration &&
+        previous.fields.map(f => (f.name, f.width, f.values.size, f.vector)) ==
+          gen.fields.map(f => (f.name, f.width, f.values.size, f.vector)) &&
+        previous.desiredCppName == gen.desiredCppName &&
+        previous.isFlatten == gen.isFlatten &&
+        (!gen.isFlatten || previous.numFlattenElements == gen.numFlattenElements),
+        s"Incompatible probe layouts for ${gen.desiredModuleName}")
+    }
+    val id = registry.instances.size
+    registry.instances += gen
     id
   }
-
-  def hasDPIC: Boolean = instances.exists(_._2 == "dpic")
-  def finish(cpu: String, cppHeader: Option[String] = Some("dpic")): Unit = {
-    DPIC.collect()
-    if (cppHeader.isDefined) {
-      generateCppHeader(cpu, cppHeader.get)
+  private[difftest] def addInterface(name: String, prototype: String, body: String): Unit = {
+    registry.interfaces.get(name).foreach { previous =>
+      require(previous == (prototype -> body), s"Incompatible DPI declarations for $name")
     }
+    registry.interfaces(name) = prototype -> body
   }
-
-  def generateCppHeader(cpu: String, style: String): Unit = {
-    val difftestCpp = ListBuffer.empty[String]
-    difftestCpp += "#ifndef __DIFFSTATE_H__"
-    difftestCpp += "#define __DIFFSTATE_H__"
-    difftestCpp += ""
-    difftestCpp += "#include <cstdint>"
-    difftestCpp += ""
-
-    val cpu_s = cpu.replace("-", "_").replace(" ", "").toUpperCase
-    difftestCpp += s"#define CPU_$cpu_s"
-    difftestCpp += ""
-
-    val headerInstances = instances.filter(_._2 == style)
-
-    val numCores = headerInstances.count(_._1.isUniqueIdentifier)
-    difftestCpp += s"#define NUM_CORES $numCores"
-    difftestCpp += ""
-
-    val uniqBundles = headerInstances.groupBy(_._1.desiredModuleName)
-    // Create cpp declaration for each bundle type
-    uniqBundles.values.map(_.map(_._1)).foreach(bundles => {
-      val bundleType = bundles.head
-      difftestCpp += bundleType.toCppDeclMacro
-      val macroName = bundleType.desiredCppName.toUpperCase
-      if (bundleType.isInstanceOf[DifftestWithIndex]) {
-        val configWidthName = s"CONFIG_DIFF_${macroName}_WIDTH"
-        require(bundles.length % numCores == 0, s"Cores seem to have different # of ${macroName}")
-        difftestCpp += s"#define $configWidthName ${bundles.length / numCores}"
-      }
-      if (bundleType.isFlatten) {
-        val configWidthName = s"CONFIG_DIFF_${macroName}_WIDTH"
-        difftestCpp += s"#define $configWidthName ${bundleType.numFlattenElements}"
-      }
-      difftestCpp += bundleType.toCppDeclaration
-      difftestCpp += ""
-    })
-
-    // create top-level difftest struct
-    difftestCpp += "typedef struct {"
-    for ((className, cppInstances) <- uniqBundles.toSeq.sortBy(_._2.head._1.order)) {
-      val bundleType = cppInstances.head._1
-      val instanceName = bundleType.desiredCppName
-      val cppIsArray = bundleType.isInstanceOf[DifftestWithIndex] || bundleType.isFlatten
-      val nInstances = cppInstances.length
-      val instanceCount = if (bundleType.isFlatten) bundleType.numFlattenElements else nInstances / numCores
-      require(nInstances % numCores == 0, s"Cores seem to have different # of ${instanceName}")
-      require(cppIsArray || nInstances == numCores, s"# of ${instanceName} should not be ${nInstances}")
-      val arrayWidth = if (cppIsArray) s"[$instanceCount]" else ""
-      difftestCpp += f"  $className%-30s $instanceName$arrayWidth;"
+  def hasDPIC: Boolean = registry.instances.nonEmpty
+  private def defaultOutputDir: String =
+    Paths.get(GlobalData.get.config.targetDirectory, "generated-src").toString
+  def finish(cpu: String, cppHeader: Option[String] = Some("dpic"),
+             outputDir: String = defaultOutputDir): Unit = {
+    cppHeader.foreach { style => generateCppHeader(cpu, style, outputDir) }
+    val interfaces = registry.interfaces.values.toSeq
+    write(outputDir, "difftest-dpic.h",
+      "#ifndef __DIFFTEST_DPIC_H__\n#define __DIFFTEST_DPIC_H__\n#include <cstdint>\n\n" +
+        interfaces.map(_._1 + ";").mkString("\n\n") + "\n#endif\n")
+    write(outputDir, "difftest-dpic.cpp",
+      "#ifndef CONFIG_NO_DIFFTEST\n#include \"difftest.h\"\n#include \"difftest-dpic.h\"\n#include <cassert>\n\n" +
+        interfaces.map(_._2).mkString("\n\n") + "\n#endif\n")
+  }
+  def generateCppHeader(cpu: String, style: String = "dpic",
+                        outputDir: String = defaultOutputDir): Unit = {
+    require(style == "dpic")
+    val instances = registry.instances.toSeq
+    val numCores = instances.count(_.isUniqueIdentifier)
+    require(numCores > 0, "Instantiate one DiffArchEvent per core before finish()")
+    val groups = instances.groupBy(_.desiredModuleName).toSeq.sortBy(_._2.head.order)
+    require(groups.map(_._2.head.desiredCppName).distinct.size == groups.size,
+      "Different probe types cannot share a C++ state member")
+    val declarations = groups.map { case (_, copies) =>
+      val gen = copies.head
+      require(copies.size % numCores == 0, s"Different number of ${gen.desiredCppName} per core")
+      require(gen.isIndexed || gen.isFlatten || copies.size == numCores,
+        s"Duplicate unindexed probe ${gen.desiredCppName}")
+      val width = if (gen.isFlatten) gen.numFlattenElements else copies.size / numCores
+      val macroWidth = if (gen.isIndexed || gen.isFlatten)
+        s"#define CONFIG_DIFF_${gen.desiredCppName.toUpperCase}_WIDTH $width\n" else ""
+      gen.toCppDeclMacro + "\n" + macroWidth + gen.toCppDeclaration
     }
-    difftestCpp += "} DiffTestState;"
-    difftestCpp += ""
-
-    difftestCpp += "#endif // __DIFFSTATE_H__"
-    difftestCpp += ""
-
-    val outputDir = sys.env("NOOP_HOME") + "/build/generated-src"
-    Files.createDirectories(Paths.get(outputDir))
-    val outputFile = outputDir + "/diffstate.h"
-    Files.write(Paths.get(outputFile), difftestCpp.mkString("\n").getBytes(StandardCharsets.UTF_8))
+    val members = groups.map { case (name, copies) =>
+      val gen = copies.head
+      val width = if (gen.isFlatten) gen.numFlattenElements else copies.size / numCores
+      val array = if (gen.isIndexed || gen.isFlatten) s"[$width]" else ""
+      s"  $name ${gen.desiredCppName}$array;"
+    }
+    val cpuName = cpu.toUpperCase.replaceAll("[^A-Z0-9_]", "_")
+    require(cpuName.nonEmpty, "CPU name cannot be empty")
+    write(outputDir, "diffstate.h",
+      s"#ifndef __DIFFSTATE_H__\n#define __DIFFSTATE_H__\n#include <cstdint>\n\n#define CPU_$cpuName\n#define NUM_CORES $numCores\n\n" +
+        declarations.mkString("\n\n") + "\n\ntypedef struct {\n" + members.mkString("\n") +
+        "\n} DiffTestState;\n\n#endif\n")
   }
-}
-
-private class Delayer[T <: Data](gen: T, n_cycles: Int) extends Module {
-  val i = IO(Input(gen.cloneType))
-  val o = IO(Output(gen.cloneType))
-
-  var r = WireInit(i)
-  for (_ <- 0 until n_cycles) {
-    r = RegNext(r)
+  private def write(directory: String, name: String, content: String): Unit = {
+    val dir = Paths.get(directory)
+    Files.createDirectories(dir)
+    Files.write(dir.resolve(name), content.getBytes(StandardCharsets.UTF_8))
   }
-  o := r
 }
 
 object Delayer {
-  def apply[T <: Data](gen: T, n_cycles: Int): T = {
-    if (n_cycles > 0) {
-      val delayer = Module(new Delayer(gen, n_cycles))
-      delayer.i := gen
-      delayer.o
-    }
-    else {
-      gen
-    }
+  def apply[T <: Data](gen: T, cycles: Int): T = {
+    require(cycles >= 0)
+    (0 until cycles).foldLeft(gen) { (data, _) => RegNext(data) init(data.getZero) }
   }
 }
-
-// Difftest emulator top
-
-// XiangShan log / perf ctrl, should be inited in SimTop IO
-// If not needed, just ingore these signals
 class PerfInfoIO extends Bundle {
-  val clean = Input(Bool())
-  val dump = Input(Bool())
+  val clean = in Bool()
+  val dump = in Bool()
 }
-
 class LogCtrlIO extends Bundle {
-  val log_begin, log_end = Input(UInt(64.W))
-  val log_level = Input(UInt(64.W)) // a cpp uint
+  val log_begin = in UInt(64 bits)
+  val log_end = in UInt(64 bits)
+  val log_level = in UInt(64 bits)
 }
-
-// UART IO, if needed, should be inited in SimTop IO
-// If not needed, just hardwire all output to 0
 class UARTIO extends Bundle {
   val out = new Bundle {
-    val valid = Output(Bool())
-    val ch = Output(UInt(8.W))
+    val valid = spinal.core.out(Bool())
+    val ch = spinal.core.out(UInt(8 bits))
   }
   val in = new Bundle {
-    val valid = Output(Bool())
-    val ch = Input(UInt(8.W))
+    val valid = spinal.core.out(Bool())
+    val ch = spinal.core.in(UInt(8 bits))
   }
 }

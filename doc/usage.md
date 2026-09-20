@@ -1,6 +1,9 @@
 Difftest 使用指南
 ===============
 
+本文保留历史 Chisel / RV64 的接入背景。本分支的 Scala API 已迁移到 SpinalHDL，
+当前构建命令、参数和集成示例见 [README](../README.md)，不要直接使用下文的 Chisel 示例。
+
 本仓库提供了一个基于 verilator 进行 difftest 的仿真顶层.
 
 本文档将介绍如何将 difftest 框架接入到一个使用 Chisel 设计的处理器项目中. 对于使用 verilog 的设计, 接入 difftest 框架的整体操作是类似的.
