@@ -17,6 +17,7 @@
 #include "refproxy.h"
 #include <unistd.h>
 #include <dlfcn.h>
+#include <string>
 
 uint8_t* ref_golden_mem = NULL;
 const char *difftest_ref_so = NULL;
@@ -24,8 +25,7 @@ const char *difftest_ref_so = NULL;
 #define check_and_assert(func)                                \
   do {                                                        \
     if (!func) {                                              \
-      printf("Failed loading %s: %s\n", #func, dlerror());    \
-      fflush(stdout); assert(func);                           \
+      throw std::runtime_error("REF is missing required symbol: " #func); \
     }                                                         \
   } while (0);
 
@@ -43,8 +43,12 @@ REF_ALL(DeclExtRefFunc)
 REF_OPTIONAL(DeclWeakExtRefFunc)
 #endif
 
-AbstractRefProxy::AbstractRefProxy(int coreid, size_t ram_size, const char *env, const char *file_path) :
-  handler(load_handler(env, file_path)) {
+AbstractRefProxy::AbstractRefProxy(int coreid, size_t ram_size, const char *env, const char *file_path,
+                                 RefBackend selected_backend) : backend(selected_backend) {
+  if (backend == RefBackend::Unavailable || backend != default_ref_backend)
+    throw std::runtime_error("REF backend does not match the generated ISA/state profile");
+  handler = load_handler(env, file_path);
+  try {
 #ifdef LINKED_REFPROXY_LIB
 #define GetRefFunc(dummy, ref_func, ret, ...) ref_func
 #else
@@ -53,6 +57,38 @@ AbstractRefProxy::AbstractRefProxy(int coreid, size_t ram_size, const char *env,
 #define LoadRefFunc(this_func, ref_func, ret, ...)  this_func = GetRefFunc(, ref_func, ret, __VA_ARGS__);
 #define CheckRefFunc(this_func, ref_func, ret, ...) check_and_assert(this_func);
 
+  if ((backend == RefBackend::NemuRV32V2 || backend == RefBackend::NemuRV64V2)) {
+#ifdef LINKED_REFPROXY_LIB
+    throw std::runtime_error("The NEMU v2 backend currently requires a dynamically loaded REF");
+#else
+    if (NUM_CORES != 1 || coreid != 0)
+      throw std::runtime_error("The NEMU v2 backend currently supports one hart");
+    ref_init_v2 = load_function<void (*)(unsigned)>("difftest_init_v2");
+    ref_status = load_function<int (*)()>("difftest_status");
+    ref_regcpy_v2 = load_function<void (*)(void *, bool)>("difftest_regcpy");
+    ref_memcpy = load_function<void (*)(uint64_t, void *, size_t, bool)>("difftest_memcpy");
+    ref_exec = load_function<void (*)(uint64_t)>("difftest_exec");
+    ref_close = load_function<void (*)()>("difftest_close");
+    check_and_assert(ref_init_v2);
+    check_and_assert(ref_status);
+    check_and_assert(ref_regcpy_v2);
+    check_and_assert(ref_memcpy);
+    check_and_assert(ref_exec);
+    store_commit = load_function<int (*)(uint64_t *, uint64_t *, uint8_t *)>("difftest_store_commit");
+    check_and_assert(store_commit);
+    update_config = load_function<void (*)(void *)>("update_dynamic_config");
+    ref_csrcpy = load_function<void (*)(void *, bool)>("difftest_csrcpy");
+    ref_reg_display = load_function<void (*)()>("difftest_display");
+    ref_set_ramsize = load_function<void (*)(size_t)>("difftest_set_ramsize");
+    if (ram_size) {
+      check_and_assert(ref_set_ramsize);
+      ref_set_ramsize(ram_size);
+    }
+    ref_init_v2(sizeof(RefState));
+    check_status();
+    return;
+#endif
+  }
   REF_ALL(LoadRefFunc)
   REF_ALL(CheckRefFunc)
   REF_OPTIONAL(LoadRefFunc)
@@ -73,6 +109,27 @@ AbstractRefProxy::AbstractRefProxy(int coreid, size_t ram_size, const char *env,
   }
 
   ref_init();
+  } catch (...) {
+    if (ref_close) ref_close();
+    if (handler) dlclose(handler);
+    handler = nullptr;
+    throw;
+  }
+}
+
+void AbstractRefProxy::check_status() const {
+  if (ref_status && ref_status() != 0) throw std::runtime_error("NEMU REF reported failure");
+}
+
+void AbstractRefProxy::copy_state(void *state, bool to_ref, bool legacy_restore) {
+  if ((backend == RefBackend::NemuRV32V2 || backend == RefBackend::NemuRV64V2)) ref_regcpy_v2(state, to_ref);
+  else ref_regcpy(state, to_ref, legacy_restore);
+  check_status();
+}
+
+void AbstractRefProxy::require_legacy(const char *operation) const {
+  if (backend != RefBackend::LegacyRV64)
+    throw std::runtime_error(std::string("REF profile does not support ") + operation);
 }
 
 AbstractRefProxy::~AbstractRefProxy() {
@@ -87,34 +144,31 @@ void *AbstractRefProxy::load_handler(const char *env, const char *file_path) {
   return nullptr;
 #endif
 
-  bool use_given_diff = true;
-
-  if (difftest_ref_so == NULL) {
-    const char *ref_home = getenv(env);
+  std::string path;
+  if (difftest_ref_so) {
+    path = difftest_ref_so;
+  } else {
+    const char *ref_home = env ? getenv(env) : nullptr;
     if (ref_home == NULL) {
 #ifdef REF_HOME
       ref_home = REF_HOME;
 #else
-      printf("FATAL: $(%s) is not defined!\n", env);
-      exit(1);
+      throw std::runtime_error("Specify a REF library or its home directory");
 #endif // REF_HOME
     }
-    char *buf = (char *)malloc(256);
-    sprintf(buf, "%s/%s", ref_home, file_path);
-    difftest_ref_so = buf;
-    use_given_diff = false;
+    if (!file_path) throw std::runtime_error("No default REF library for this profile");
+    path = std::string(ref_home) + "/" + file_path;
   }
 
-  Info("The reference model is %s\n", difftest_ref_so);
+  Info("The reference model is %s\n", path.c_str());
 
-  int mode = RTLD_LAZY | RTLD_DEEPBIND;
-  void *so_handler = (NUM_CORES > 1) ? dlmopen(LM_ID_NEWLM, difftest_ref_so, mode) : dlopen(difftest_ref_so, mode);
-  check_and_assert(so_handler);
-
-  if (!use_given_diff) {
-    free((void *)difftest_ref_so);
-    difftest_ref_so = nullptr;
-  }
+  int mode = RTLD_LAZY;
+  // ASan must interpose allocator calls in a sanitized reference too.
+#if !defined(DIFFTEST_SANITIZE)
+  mode |= RTLD_DEEPBIND;
+#endif
+  void *so_handler = (NUM_CORES > 1) ? dlmopen(LM_ID_NEWLM, path.c_str(), mode) : dlopen(path.c_str(), mode);
+  if (!so_handler) throw std::runtime_error(std::string("Cannot load REF: ") + dlerror());
 
   return so_handler;
 }
@@ -133,23 +187,25 @@ RefProxy::~RefProxy() {
 
 
 void RefProxy::regcpy(DiffTestState *dut) {
-  memcpy(&regs_int, dut->regs_int.value, 32 * sizeof(uint64_t));
+  state.regs_int = dut->regs_int;
 #ifdef CONFIG_DIFFTEST_ARCHFPREGSTATE
-  memcpy(&regs_fp, dut->regs_fp.value, 32 * sizeof(uint64_t));
+  state.regs_fp = dut->regs_fp;
 #endif // CONFIG_DIFFTEST_ARCHFPREGSTATE
-  memcpy(&csr, &dut->csr, sizeof(csr));
-  pc = dut->commit[0].pc;
+#ifdef CONFIG_DIFFTEST_CSRSTATE
+  state.csr = dut->csr;
+#endif
+  state.pc = dut->commit[0].pc;
 #ifdef CONFIG_DIFFTEST_ARCHVECREGSTATE
-  memcpy(&regs_vec, &dut->regs_vec.value, sizeof(regs_vec));
+  state.regs_vec = dut->regs_vec;
 #endif // CONFIG_DIFFTEST_ARCHVECREGSTATE
 #ifdef CONFIG_DIFFTEST_VECCSRSTATE
-  memcpy(&vcsr, &dut->vcsr, sizeof(vcsr));
+  state.vcsr = dut->vcsr;
 #endif // CONFIG_DIFFTEST_VECCSRSTATE
-  ref_regcpy(&regs_int, DUT_TO_REF, false);
+  copy_state(&state, DUT_TO_REF, false);
 };
 
 int RefProxy::compare(DiffTestState *dut) {
-#define PROXY_COMPARE(field) memcmp(&(dut->field), &(field), sizeof(field))
+#define PROXY_COMPARE(field) memcmp(&(dut->field), &(state.field), sizeof(state.field))
 
   const int results[] = {
     PROXY_COMPARE(regs_int),
@@ -162,12 +218,15 @@ int RefProxy::compare(DiffTestState *dut) {
 #ifdef CONFIG_DIFFTEST_VECCSRSTATE
     PROXY_COMPARE(vcsr),
 #endif // CONFIG_DIFFTEST_VECCSRSTATE
+#ifdef CONFIG_DIFFTEST_CSRSTATE
     PROXY_COMPARE(csr)
+#endif
 
   };
   for (int i = 0; i < sizeof(results) / sizeof(int); i++) {
     if (results[i]) {
       // There may be some waive rules for CSRs
+#ifdef CONFIG_DIFFTEST_CSRSTATE
       if (i == sizeof(results) / sizeof(int) - 1) {
         // If mismatches are cleared, we sync the states back to REF.
         if (do_csr_waive(dut) && !PROXY_COMPARE(csr)) {
@@ -175,23 +234,38 @@ int RefProxy::compare(DiffTestState *dut) {
           return 0;
         }
       }
+#endif
       return 1;
     }
   }
   return 0;
 };
 
+// Copy individual scalar words instead of aliasing a struct as uint64_t[].
+static void display_words(const void *dut, const void *ref, const char *const *names,
+                          size_t count, uint64_t pc, size_t width) {
+  for (size_t i = 0; i < count; ++i) {
+    uint64_t actual = 0, expected = 0;
+    memcpy(&actual, static_cast<const uint8_t *>(dut) + i * width, width);
+    memcpy(&expected, static_cast<const uint8_t *>(ref) + i * width, width);
+    if (actual != expected)
+      printf("%7s different at pc = 0x%010lx, right= 0x%016lx, wrong = 0x%016lx\n",
+             names[i], pc, expected, actual);
+  }
+}
+
 void RefProxy::display(DiffTestState *dut) {
   if (dut) {
 #define PROXY_COMPARE_AND_DISPLAY(field, field_names)                   \
 do {                                                                  \
-  uint64_t *_ptr_dut = (uint64_t *)(&((dut)->field));                 \
-  uint64_t *_ptr_ref = (uint64_t *)(&(field));                    \
-  for (int i = 0; i < sizeof(field) / sizeof(uint64_t); i ++) {   \
+  using element_t = std::remove_reference_t<decltype(state.field.value[0])>; \
+  const auto *_ptr_dut = dut->field.value;                              \
+  const auto *_ptr_ref = state.field.value;                             \
+  for (size_t i = 0; i < sizeof(state.field) / sizeof(element_t); i ++) { \
     if (_ptr_dut[i] != _ptr_ref[i]) {                                 \
       printf("%7s different at pc = 0x%010lx, right= 0x%016lx, "      \
-              "wrong = 0x%016lx\n", field_names[i], dut->commit[0].pc, \
-              _ptr_ref[i], _ptr_dut[i]);                               \
+              "wrong = 0x%016lx\n", field_names[i], uint64_t(dut->commit[0].pc), \
+              uint64_t(_ptr_ref[i]), uint64_t(_ptr_dut[i]));             \
     }                                                                 \
   }                                                                   \
 } while(0);
@@ -200,16 +274,23 @@ do {                                                                  \
 #ifdef CONFIG_DIFFTEST_ARCHFPREGSTATE
     PROXY_COMPARE_AND_DISPLAY(regs_fp, regs_name_fp)
 #endif // CONFIG_DIFFTEST_ARCHFPREGSTATE
-    PROXY_COMPARE_AND_DISPLAY(csr, regs_name_csr)
+#ifdef CONFIG_DIFFTEST_CSRSTATE
+    display_words(&dut->csr, &state.csr, regs_name_csr, 18, dut->commit[0].pc, sizeof(diff_int_t));
+#endif
 #ifdef CONFIG_DIFFTEST_ARCHVECREGSTATE
     PROXY_COMPARE_AND_DISPLAY(regs_vec, regs_name_vec)
 #endif // CONFIG_DIFFTEST_ARCHVECREGSTATE
 #ifdef CONFIG_DIFFTEST_VECCSRSTATE
-    PROXY_COMPARE_AND_DISPLAY(vcsr, regs_name_vec_csr)
+    display_words(&dut->vcsr, &state.vcsr, regs_name_vec_csr, 7, dut->commit[0].pc, sizeof(diff_int_t));
 #endif // CONFIG_DIFFTEST_VECCSRSTATE
   }
   else {
-    ref_reg_display();
+    if (ref_reg_display) ref_reg_display();
+    else {
+      printf("REF pc = 0x%016lx\n", uint64_t(state.pc));
+      for (unsigned i = 0; i < 32; ++i)
+        printf("%7s = 0x%016lx\n", regs_name_int[i], read_arch_reg(i));
+    }
   }
 };
 
@@ -243,12 +324,13 @@ static uint64_t read_mtvec(uint64_t paddr) {
 }
 #endif // CPU_ROCKET_CHIP
 
+#ifdef CONFIG_DIFFTEST_CSRSTATE
 bool RefProxy::do_csr_waive(DiffTestState *dut) {
 #define CSR_WAIVE(field, mapping)                             \
   do {                                                        \
-    uint64_t v = mapping(csr.field);                          \
-    if (csr.field != dut->csr.field && dut->csr.field == v) { \
-      csr.field = v;                                          \
+    uint64_t v = mapping(state.csr.field);                          \
+    if (state.csr.field != dut->csr.field && dut->csr.field == v) { \
+      state.csr.field = v;                                          \
       has_waive = true;                                       \
     }                                                         \
   } while (0);
@@ -264,9 +346,14 @@ bool RefProxy::do_csr_waive(DiffTestState *dut) {
 #endif // CPU_ROCKET_CHIP
   return has_waive;
 }
+#endif
 
 #define NEMU_ENV_VARIABLE "NEMU_HOME"
+#ifdef DIFFTEST_REF_ABI_NEMU_RV32_V2
+#define NEMU_SO_FILENAME  "build/riscv32-nemu-interpreter-so"
+#else
 #define NEMU_SO_FILENAME  "build/riscv64-nemu-interpreter-so"
+#endif
 NemuProxy::NemuProxy(int coreid, size_t ram_size) :
   RefProxy(coreid, ram_size, NEMU_ENV_VARIABLE, NEMU_SO_FILENAME) {
 }

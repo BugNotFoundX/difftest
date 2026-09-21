@@ -80,6 +80,18 @@ class MigrationSpec extends AnyFunSuite {
     verilate(config(dir).generateSystemVerilog(new MemoryTop), dir, "MemoryTop", "memory.cpp", withDpi = false)
   }
 
+  test("LA32R schema retains generated DPI without claiming a runnable reference backend") {
+    val dir = directory("la32r-")
+    val report = config(dir).generateSystemVerilog(new TransportTop(32, "la32r"))
+    val header = read(dir.resolve("generated-src/diffstate.h"))
+    assert(header.contains("#define DIFFTEST_ISA_LA32R 1"))
+    assert(header.contains("#define DIFFTEST_REF_ABI_NONE 1"))
+    write(dir.resolve("difftest.h"),
+      "#pragma once\n#include \"diffstate.h\"\n" +
+        "struct TestDifftest { DiffTestState dut; };\nextern TestDifftest **difftest;\n")
+    verilate(report, dir, "TransportTop", "transport.cpp", withDpi = true)
+  }
+
   test("invalid widths and incompatible same-name probe layouts fail before producing interfaces") {
     intercept[IllegalArgumentException] { Widths.checkXlen(16) }
     intercept[IllegalArgumentException] { Widths.storageBits(65) }

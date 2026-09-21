@@ -34,6 +34,9 @@ int difftest_init() {
 int init_nemuproxy(size_t ramsize = 0) {
   for (int i = 0; i < NUM_CORES; i++) {
     difftest[i]->update_nemuproxy(i, ramsize);
+#ifdef DIFFTEST_CHECK_INITIAL_STATE
+    difftest[i]->initialize_reference();
+#endif
   }
   return 0;
 }
@@ -97,6 +100,15 @@ void Difftest::update_nemuproxy(int coreid, size_t ram_size = 0) {
 }
 
 int Difftest::step() {
+#ifdef DIFFTEST_CHECK_INITIAL_STATE
+  if (dut.event.valid || dut.trap.hasWFI)
+    throw std::runtime_error("Integer profile rejects exception/interrupt/WFI");
+  unsigned stores = 0;
+  for (const auto &s : dut.store) stores += s.valid;
+  if (stores != unsigned(expected_store))
+    throw std::runtime_error("Missing or extra retired store probe");
+  expected_store = false;
+#endif
   progress = false;
   ticks++;
 
@@ -184,9 +196,11 @@ int Difftest::step() {
   }
 
   // FIXME: the following code is dirty
-  if (dut.csr.mip != proxy->csr.mip) {  // Ignore difftest for MIP
-    proxy->csr.mip = dut.csr.mip;
+#ifdef CONFIG_DIFFTEST_CSRSTATE
+  if (dut.csr.mip != proxy->state.csr.mip) {  // Ignore difftest for MIP
+    proxy->state.csr.mip = dut.csr.mip;
   }
+#endif
 
   if (apply_delayed_writeback()) {
     return 1;
@@ -211,12 +225,15 @@ int Difftest::step() {
 }
 
 void Difftest::do_interrupt() {
+  proxy->require_legacy("interrupts");
   state->record_interrupt(dut.event.exceptionPC, dut.event.exceptionInst, dut.event.interrupt);
-  proxy->raise_intr(dut.event.interrupt | (1ULL << 63));
+  proxy->raise_intr(dut.event.interrupt | (1ULL << (DIFFTEST_XLEN - 1)));
   progress = true;
 }
 
 void Difftest::do_exception() {
+  proxy->require_legacy("exceptions");
+#ifdef CONFIG_DIFFTEST_CSRSTATE
   state->record_exception(dut.event.exceptionPC, dut.event.exceptionInst, dut.event.exception);
   if (dut.event.exception == 12 || dut.event.exception == 13 || dut.event.exception == 15) {
     struct ExecutionGuide guide;
@@ -232,7 +249,7 @@ void Difftest::do_exception() {
       debug_mode_copy(dut.event.exceptionPC, 4, dut.event.exceptionInst);
     }
   #endif
-    proxy->ref_exec(1);
+    proxy->execute(1);
   }
 
 #ifdef FUZZING
@@ -257,13 +274,38 @@ void Difftest::do_exception() {
 #endif // FUZZING
 
   progress = true;
+#else
+  throw std::runtime_error("Exception event requires CSR state");
+#endif
 }
 
 int Difftest::do_instr_commit(int i) {
+#ifdef DIFFTEST_CHECK_INITIAL_STATE
+  const auto &c = dut.commit[i];
+  if (c.skip || c.nFused || c.isRVC || c.fpwen || c.vecwen || c.special)
+    throw std::runtime_error("Unsupported commit flags");
+  const unsigned opcode = c.instr & 0x7f;
+  switch (opcode) {
+    case 0x03: case 0x23: case 0x13: case 0x33: case 0x37: case 0x17:
+    case 0x63: case 0x67: case 0x6f: case 0x0f: break;
+#if DIFFTEST_XLEN == 64
+    case 0x1b: case 0x3b: break;
+#endif
+    default: throw std::runtime_error("Instruction outside the integer test profile");
+  }
+  if (bool(c.isStore) != (opcode == 0x23) || bool(c.isLoad) != (opcode == 0x03))
+    throw std::runtime_error("Invalid load/store commit metadata");
+  if (c.pc != proxy->state.pc) throw std::runtime_error("Pre-exec PC mismatch");
+  uint32_t instr = 0;
+  proxy->ref_memcpy(c.pc, &instr, sizeof(instr), REF_TO_DUT);
+  proxy->check_status();
+  if (instr != c.instr) throw std::runtime_error("Instruction bytes differ from REF memory");
+  expected_store = c.isStore;
+#endif
 
   // store the writeback info to debug array
 #ifdef BASIC_DIFFTEST_ONLY
-  uint64_t commit_pc = proxy->pc;
+  uint64_t commit_pc = proxy->state.pc;
 #else
   uint64_t commit_pc = dut.commit[i].pc;
 #endif
@@ -332,10 +374,10 @@ int Difftest::do_instr_commit(int i) {
   }
 
   // single step exec
-  proxy->ref_exec(1);
+  proxy->execute(1);
   // when there's a fused instruction, let proxy execute more instructions.
   for (int j = 0; j < dut.commit[i].nFused; j++) {
-    proxy->ref_exec(1);
+    proxy->execute(1);
   }
 
   // Handle load instruction carefully for SMP
@@ -343,7 +385,7 @@ int Difftest::do_instr_commit(int i) {
 #ifdef CONFIG_DIFFTEST_LOADEVENT
     if (dut.load[i].fuType == 0xC || dut.load[i].fuType == 0xF) {
       proxy->sync();
-      bool reg_cmp_fail = !dut.commit[i].vecwen && *proxy->arch_reg(dut.commit[i].wdest, dut.commit[i].fpwen) != get_commit_data(i);
+      bool reg_cmp_fail = !dut.commit[i].vecwen && proxy->read_arch_reg(dut.commit[i].wdest, dut.commit[i].fpwen) != get_commit_data(i);
       if (realWen && reg_cmp_fail) {
         // printf("---[DIFF Core%d] This load instruction gets rectified!\n", this->id);
         // printf("---    ltype: 0x%x paddr: 0x%lx wen: 0x%x wdst: 0x%x wdata: 0x%lx pc: 0x%lx\n", dut.load[i].opType, dut.load[i].paddr, dut.commit[i].wen, dut.commit[i].wdest, get_commit_data(i), dut.commit[i].pc);
@@ -381,7 +423,7 @@ int Difftest::do_instr_commit(int i) {
           proxy->ref_memcpy(dut.load[i].paddr, &golden, len, DUT_TO_REF);
           if (realWen) {
             if (!dut.commit[i].vecwen) {
-              *proxy->arch_reg(dut.commit[i].wdest, dut.commit[i].fpwen) = get_commit_data(i);
+              proxy->write_arch_reg(dut.commit[i].wdest, get_commit_data(i), dut.commit[i].fpwen);
             }
             proxy->sync(true);
           }
@@ -389,7 +431,7 @@ int Difftest::do_instr_commit(int i) {
           proxy->ref_memcpy(dut.load[i].paddr, &golden, len, DUT_TO_REF);
           if (realWen) {
             if (!dut.commit[i].vecwen) {
-              *proxy->arch_reg(dut.commit[i].wdest, dut.commit[i].fpwen) = get_commit_data(i);
+              proxy->write_arch_reg(dut.commit[i].wdest, get_commit_data(i), dut.commit[i].fpwen);
             }
             proxy->sync(true);
           }
@@ -405,7 +447,7 @@ int Difftest::do_instr_commit(int i) {
           proxy->ref_memcpy(dut.load[i].paddr, &golden, len, DUT_TO_REF);
           if (realWen) {
             if (!dut.commit[i].vecwen) {
-              *proxy->arch_reg(dut.commit[i].wdest, dut.commit[i].fpwen) = get_commit_data(i);
+              proxy->write_arch_reg(dut.commit[i].wdest, get_commit_data(i), dut.commit[i].fpwen);
             }
             proxy->sync(true);
           }
@@ -416,6 +458,18 @@ int Difftest::do_instr_commit(int i) {
 #endif // CONFIG_DIFFTEST_LOADEVENT
   }
   return 0;
+}
+
+void Difftest::initialize_reference() {
+  simMemory->clone_on_demand([this](uint64_t offset, void *src, size_t n) {
+    proxy->ref_memcpy(PMEM_BASE + offset, src, n, DUT_TO_REF);
+    proxy->check_status();
+  }, true);
+  proxy->sync();
+  proxy->state.regs_int = {};
+  proxy->state.pc = FIRST_INST_ADDRESS;
+  proxy->copy_state(&proxy->state, DUT_TO_REF);
+  has_commit = true;
 }
 
 void Difftest::do_first_instr_commit() {
@@ -453,8 +507,8 @@ int Difftest::do_store_check() {
     if (!dut.store[i].valid) {
       return 0;
     }
-    auto addr = dut.store[i].addr;
-    auto data = dut.store[i].data;
+    uint64_t addr = dut.store[i].addr;
+    uint64_t data = dut.store[i].data;
     auto mask = dut.store[i].mask;
     if (proxy->store_commit(&addr, &data, &mask)) {
 #ifdef FUZZING
@@ -467,7 +521,7 @@ int Difftest::do_store_check() {
       printf("Mismatch for store commits %d: \n", i);
       printf("  REF commits addr 0x%lx, data 0x%lx, mask 0x%x\n", addr, data, mask);
       printf("  DUT commits addr 0x%lx, data 0x%lx, mask 0x%x\n",
-        dut.store[i].addr, dut.store[i].data, dut.store[i].mask);
+        uint64_t(dut.store[i].addr), uint64_t(dut.store[i].data), dut.store[i].mask);
       return 1;
     }
     dut.store[i].valid = 0;
@@ -763,7 +817,7 @@ int Difftest::check_timeout() {
         "(please also check whether a fence.i instruction requires more than %lu cycles to flush the icache)\n",
         id, stuck_limit, stuck_limit);
     Info("Let REF run one more instruction.\n");
-    proxy->ref_exec(1);
+    proxy->execute(1);
     display();
     return 1;
   }
@@ -819,7 +873,7 @@ int Difftest::apply_delayed_writeback() {
           return 1;                                                            \
         }                                                                      \
         delayed[i]++;                                                          \
-        dut.regs.value[i] = proxy->regs.value[i];                              \
+        dut.regs.value[i] = proxy->state.regs.value[i];                         \
       }                                                                        \
     }                                                                          \
   } while (0);
@@ -843,8 +897,10 @@ void Difftest::display() {
 
   printf("\n==============  REF Regs  ==============\n");
   fflush(stdout);
-  proxy->ref_reg_display();
+  proxy->display();
+#ifdef CONFIG_DIFFTEST_CSRSTATE
   printf("priviledgeMode: %lu\n", dut.csr.priviledgeMode);
+#endif
 }
 
 void CommitTrace::display(bool use_spike) {

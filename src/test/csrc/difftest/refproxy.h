@@ -21,6 +21,8 @@
 #include <dlfcn.h>
 
 #include "common.h"
+#include "ref-state.h"
+#include <stdexcept>
 
 static const char *regs_name_int[] = {
   "$0",  "ra",  "sp",   "gp",   "tp",  "t0",  "t1",   "t2",
@@ -114,21 +116,31 @@ public:
   f(disambiguation_state, difftest_disambiguation_state, int, )
 
 #define RefFunc(func, ret, ...) ret func(__VA_ARGS__)
-#define DeclRefFunc(this_func, dummy, ret, ...) RefFunc((*this_func), ret, __VA_ARGS__);
+#define DeclRefFunc(this_func, dummy, ret, ...) RefFunc((*this_func), ret, __VA_ARGS__) = nullptr;
 
-// This class only loads the functions. It should never call anything.
+// Load each protocol with its real function signature, then initialize it.
 class AbstractRefProxy {
 public:
   REF_ALL(DeclRefFunc)
 
-  AbstractRefProxy(int coreid, size_t ram_size, const char *env, const char *file_path);
+  AbstractRefProxy(int coreid, size_t ram_size, const char *env, const char *file_path,
+                   RefBackend backend = default_ref_backend);
   ~AbstractRefProxy();
+  const RefBackend backend;
+  void check_status() const;
+  void execute(uint64_t n) { ref_exec(n); check_status(); }
+  void copy_state(void *state, bool to_ref, bool legacy_restore = false);
+  void require_legacy(const char *operation) const;
 
 protected:
   REF_OPTIONAL(DeclRefFunc)
+  void (*ref_regcpy_v2)(void *, bool) = nullptr;
+  void (*ref_init_v2)(unsigned) = nullptr;
+  int (*ref_status)() = nullptr;
+
 
 private:
-  void * const handler;
+  void *handler = nullptr;
   void *load_handler(const char *env, const char *file_path);
   template <typename T>
   T load_function(const char *func_name);
@@ -136,35 +148,34 @@ private:
 
 class RefProxy : public AbstractRefProxy {
 public:
-  RefProxy(int coreid, size_t ram_size)
-    : AbstractRefProxy(coreid, ram_size, nullptr, nullptr) {}
-  RefProxy(int coreid, size_t ram_size, const char *env, const char *file_path)
-    : AbstractRefProxy(coreid, ram_size, env, file_path) {}
+  RefProxy(int coreid, size_t ram_size, const char *env = nullptr, const char *file_path = nullptr,
+           RefBackend backend = default_ref_backend)
+    : AbstractRefProxy(coreid, ram_size, env, file_path, backend) {}
   ~RefProxy();
 
-  DifftestArchIntRegState regs_int;
-#ifdef CONFIG_DIFFTEST_ARCHFPREGSTATE
-  DifftestArchFpRegState regs_fp;
-#endif // CONFIG_DIFFTEST_ARCHFPREGSTATE
-  DifftestCSRState csr;
-  uint64_t pc;
-#ifdef CONFIG_DIFFTEST_ARCHVECREGSTATE
-  DifftestArchVecRegState regs_vec;
-#endif // CONFIG_DIFFTEST_ARCHVECREGSTATE
-#ifdef CONFIG_DIFFTEST_VECCSRSTATE
-  DifftestVecCSRState vcsr;
-#endif // CONFIG_DIFFTEST_VECCSRSTATE
+  RefState state{};
 
-  inline uint64_t *arch_reg(uint8_t src, bool is_fp = false) {
-    return
+  uint64_t read_arch_reg(uint8_t src, bool is_fp = false) const {
+    if (src >= 32) throw std::out_of_range("REF architectural register index");
 #ifdef CONFIG_DIFFTEST_ARCHFPREGSTATE
-      is_fp ? regs_fp.value + src :
+    if (is_fp) return state.regs_fp.value[src];
+#else
+    if (is_fp) throw std::runtime_error("REF has no FP state");
 #endif
-      regs_int.value + src;
+    return state.regs_int.value[src];
+  }
+  void write_arch_reg(uint8_t src, uint64_t value, bool is_fp = false) {
+    if (src >= 32) throw std::out_of_range("REF architectural register index");
+#ifdef CONFIG_DIFFTEST_ARCHFPREGSTATE
+    if (is_fp) { state.regs_fp.value[src] = value; return; }
+#else
+    if (is_fp) throw std::runtime_error("REF has no FP state");
+#endif
+    state.regs_int.value[src] = value;
   }
 
   inline void sync(bool is_from_dut = false) {
-    ref_regcpy(&regs_int, is_from_dut, is_from_dut);
+    copy_state(&state, is_from_dut, is_from_dut);
   }
 
   void regcpy(DiffTestState *dut);
@@ -172,21 +183,23 @@ public:
   void display(DiffTestState *dut = nullptr);
 
   inline void skip_one(bool isRVC, bool wen, uint32_t wdest, uint64_t wdata) {
+    require_legacy("instruction skip");
     if (ref_skip_one) {
       ref_skip_one(isRVC, wen, wdest, wdata);
     }
     else {
       sync();
-      pc += isRVC ? 2 : 4;
+      state.pc += isRVC ? 2 : 4;
       // TODO: what if skip with fpwen?
       if (wen) {
-        regs_int.value[wdest] = wdata;
+        write_arch_reg(wdest, wdata);
       }
       sync(true);
     }
   }
 
   inline void guided_exec(struct ExecutionGuide &guide) {
+    require_legacy("guided execution");
     return ref_guided_exec ? ref_guided_exec(&guide) : ref_exec(1);
   }
 
@@ -208,9 +221,12 @@ private:
   RefProxyConfig config;
 
   inline void sync_config() {
+    if (!update_config) throw std::runtime_error("REF does not support dynamic configuration");
     update_config(&config);
   }
+#ifdef CONFIG_DIFFTEST_CSRSTATE
   bool do_csr_waive(DiffTestState *dut);
+#endif
 };
 
 class NemuProxy : public RefProxy {

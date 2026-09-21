@@ -20,7 +20,10 @@
 #include <vector>
 #include "common.h"
 #include "difftrace.h"
+#include "sim-status.h"
+#ifdef FUZZER_LIB
 #include "emu.h"
+#endif
 #include "refproxy.h"
 #include "golden.h"
 
@@ -132,6 +135,9 @@ public:
   bool dump_commit_trace = false;
 
   DiffState();
+  ~DiffState() {
+    for (auto *entry : commit_trace) delete entry;
+  }
   void record_group(uint64_t pc, uint64_t count) {
     retire_group_pc_queue [retire_group_pointer] = pc;
     retire_group_cnt_queue[retire_group_pointer] = count;
@@ -183,7 +189,7 @@ private:
 
 class Difftest {
 public:
-  DiffTestState dut;
+  DiffTestState dut{};
 
   // Difftest public APIs for testbench
   // Its backend should be cross-platform (NEMU, Spike, ...)
@@ -193,6 +199,10 @@ public:
   REF_PROXY *proxy = NULL;
   uint32_t num_commit = 0; // # of commits if made progress
   bool has_commit = false;
+  void initialize_reference();
+#ifdef DIFFTEST_CHECK_INITIAL_STATE
+  bool expected_store = false;
+#endif
   // Trigger a difftest checking procdure
   int step();
   void update_nemuproxy(int, size_t);
@@ -220,12 +230,14 @@ public:
   inline DifftestTrapEvent *get_trap_event() {
     return &(dut.trap);
   }
-  uint64_t *arch_reg(uint8_t src, bool is_fp = false) {
-    return
+  uint64_t read_arch_reg(uint8_t src, bool is_fp = false) const {
+    if (src >= 32) throw std::out_of_range("DUT architectural register index");
 #ifdef CONFIG_DIFFTEST_ARCHFPREGSTATE
-      is_fp ? dut.regs_fp.value + src :
+    if (is_fp) return dut.regs_fp.value[src];
+#else
+    if (is_fp) throw std::runtime_error("DUT has no FP state");
 #endif
-      dut.regs_int.value + src;
+    return dut.regs_int.value[src];
   }
   inline DiffTestState *get_dut() {
     return &dut;
@@ -250,7 +262,7 @@ public:
 protected:
   DiffTrace *difftrace = nullptr;
 
-#if defined(CPU_NUTSHELL) || defined(CPU_ROCKET_CHIP)
+#if defined(CPU_NUTSHELL) || defined(CPU_ROCKET_CHIP) || defined(CPU_WINDRISE)
   const uint64_t firstCommit_limit = 1000;
   const uint64_t stuck_limit = 500;
 #elif defined(CPU_XIANGSHAN)
@@ -267,7 +279,7 @@ protected:
 
   uint64_t nemu_this_pc;
   DiffState *state = NULL;
-#ifdef DEBUG_REFILL
+#if defined(DEBUG_REFILL) || defined(DEBUG_GOLDENMEM)
   uint64_t track_instr = 0;
 #endif
 

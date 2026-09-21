@@ -17,13 +17,14 @@
 #ifndef __CONFIG_H
 #define __CONFIG_H
 
+#include "diffstate.h"
+
 #ifndef NUM_CORES
 #define NUM_CORES 1
 #endif
 
-#include "diffstate.h"
-
-#if defined(CPU_NUTSHELL)
+#if defined(CPU_WINDRISE)
+#elif defined(CPU_NUTSHELL)
 #elif defined(CPU_XIANGSHAN)
 #elif defined(CPU_ROCKET_CHIP)
 #else
@@ -36,13 +37,19 @@
 // -----------------------------------------------------------------------
 
 // emulated memory size (Byte)
+#ifdef CPU_WINDRISE
+#define DEFAULT_EMU_RAM_SIZE (128 * 1024 * 1024UL)
+// Platform policy, independent of the reference register-transfer ABI.
+#define DIFFTEST_CHECK_INITIAL_STATE
+#else
 #define DEFAULT_EMU_RAM_SIZE (8 * 1024 * 1024 * 1024UL) // 8 GB
+#endif
 
 // physical memory base address
 #define PMEM_BASE 0x80000000UL
 
 // first valid instruction's address, difftest starts from this instruction
-#if defined(CPU_NUTSHELL)
+#if defined(CPU_NUTSHELL) || defined(CPU_WINDRISE)
 #define FIRST_INST_ADDRESS 0x80000000UL
 #elif defined(CPU_XIANGSHAN) || defined(CPU_ROCKET_CHIP)
 #define FIRST_INST_ADDRESS 0x10000000UL
@@ -105,10 +112,14 @@ extern unsigned long EMU_FLASH_SIZE;
 // #define DEBUG_SMP
 
 // whether to check memory coherence during refilling
+#if !defined(DIFFTEST_SCHEMA_VERSION) || defined(CONFIG_DIFFTEST_REFILLEVENT)
 #define DEBUG_REFILL
+#endif
 
 // whether to check l1tlb response
+#if !defined(DIFFTEST_SCHEMA_VERSION) || defined(CONFIG_DIFFTEST_L1TLBEVENT)
 #define DEBUG_L1TLB
+#endif
 
 // whether to check l2tlb response
 // #define DEBUG_L2TLB

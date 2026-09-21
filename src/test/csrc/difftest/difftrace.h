@@ -23,6 +23,7 @@ public:
 private:
   uint64_t buffer_size;
   uint64_t buffer_count = 0;
+  uint64_t trace_index = 0;
   DiffTestState *buffer = nullptr;
 
   bool trace_file_next();

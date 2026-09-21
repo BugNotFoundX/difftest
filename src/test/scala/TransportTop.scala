@@ -3,7 +3,7 @@ package difftest
 import spinal.core._
 import difftest.common._
 
-class TransportTop(xlen: Int) extends Component {
+class TransportTop(xlen: Int, isa: String = "") extends Component {
   val io = new Bundle {
     val valid = in Bool()
     val pc = in UInt(xlen bits)
@@ -46,7 +46,8 @@ class TransportTop(xlen: Int) extends Component {
   val refill = probe(DiffRefillEvent(xlen, lineBytes = 8))
   refill.valid := io.valid
   refill.data.foreach(_ := io.data)
-  DifftestModule.finish("TEST")
+  DifftestModule.finish("TEST", target = DifftestTarget(
+    if (isa.nonEmpty) isa else s"riscv$xlen", xlen, 0, xlen, xlen, "none"))
 }
 
 class MemoryTop extends Component {

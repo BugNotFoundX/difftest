@@ -172,9 +172,12 @@ object DifftestModule {
   def hasDPIC: Boolean = registry.instances.nonEmpty
   private def defaultOutputDir: String =
     Paths.get(GlobalData.get.config.targetDirectory, "generated-src").toString
+  private def defaultTarget: DifftestTarget = DifftestTarget.legacyRV64(
+    registry.instances.collectFirst { case p: DiffArchFpRegState => p.flen }.getOrElse(0))
   def finish(cpu: String, cppHeader: Option[String] = Some("dpic"),
-             outputDir: String = defaultOutputDir): Unit = {
-    cppHeader.foreach { style => generateCppHeader(cpu, style, outputDir) }
+             outputDir: String = defaultOutputDir,
+             target: DifftestTarget = defaultTarget): Unit = {
+    cppHeader.foreach { style => generateCppHeader(cpu, style, outputDir, target) }
     val interfaces = registry.interfaces.values.toSeq
     write(outputDir, "difftest-dpic.h",
       "#ifndef __DIFFTEST_DPIC_H__\n#define __DIFFTEST_DPIC_H__\n#include <cstdint>\n\n" +
@@ -184,11 +187,13 @@ object DifftestModule {
         interfaces.map(_._2).mkString("\n\n") + "\n#endif\n")
   }
   def generateCppHeader(cpu: String, style: String = "dpic",
-                        outputDir: String = defaultOutputDir): Unit = {
+                        outputDir: String = defaultOutputDir,
+                        target: DifftestTarget = defaultTarget): Unit = {
     require(style == "dpic")
     val instances = registry.instances.toSeq
+    target.validate(instances)
     val numCores = instances.count(_.isUniqueIdentifier)
-    require(numCores > 0, "Instantiate one DiffArchEvent per core before finish()")
+    require(numCores > 0 && numCores <= 256, "Instantiate one DiffArchEvent per core (1..256)")
     val groups = instances.groupBy(_.desiredModuleName).toSeq.sortBy(_._2.head.order)
     require(groups.map(_._2.head.desiredCppName).distinct.size == groups.size,
       "Different probe types cannot share a C++ state member")
@@ -198,6 +203,7 @@ object DifftestModule {
       require(gen.isIndexed || gen.isFlatten || copies.size == numCores,
         s"Duplicate unindexed probe ${gen.desiredCppName}")
       val width = if (gen.isFlatten) gen.numFlattenElements else copies.size / numCores
+      require(!gen.isIndexed || width <= 256, "DPI index is 8 bits")
       val macroWidth = if (gen.isIndexed || gen.isFlatten)
         s"#define CONFIG_DIFF_${gen.desiredCppName.toUpperCase}_WIDTH $width\n" else ""
       gen.toCppDeclMacro + "\n" + macroWidth + gen.toCppDeclaration
@@ -210,10 +216,32 @@ object DifftestModule {
     }
     val cpuName = cpu.toUpperCase.replaceAll("[^A-Z0-9_]", "_")
     require(cpuName.nonEmpty, "CPU name cannot be empty")
+    val fingerprint = java.security.MessageDigest.getInstance("SHA-256")
+      .digest((target.macros + numCores + declarations.mkString + members.mkString)
+        .getBytes(java.nio.charset.StandardCharsets.UTF_8))
+      .take(8).map(b => f"${b & 0xff}%02x").mkString
     write(outputDir, "diffstate.h",
       s"#ifndef __DIFFSTATE_H__\n#define __DIFFSTATE_H__\n#include <cstdint>\n\n#define CPU_$cpuName\n#define NUM_CORES $numCores\n\n" +
+        target.macros + s"\n#define DIFFTEST_SCHEMA_FINGERPRINT 0x${fingerprint}ULL\n\n" +
         declarations.mkString("\n\n") + "\n\ntypedef struct {\n" + members.mkString("\n") +
         "\n} DiffTestState;\n\n#endif\n")
+    val probeSchema = groups.map { case (name, copies) =>
+      val gen = copies.head
+      val slots = if (gen.isFlatten) gen.numFlattenElements else copies.size / numCores
+      val fields = gen.stateFields.map { f =>
+        s"""{"name":"${f.name}","bits":${f.width},"storage_bits":${f.storage},"count":${f.values.size}}"""
+      }.mkString(",")
+      s"""{"type":"$name","member":"${gen.desiredCppName}","slots":$slots,"fields":[$fields]}"""
+    }.mkString(",\n    ")
+    write(outputDir, "difftest-schema.json", s"""{
+  "schema_version":1,"isa":"${target.isa}","xlen":${target.xlen},"flen":${target.flen},
+  "paddr_bits":${target.paddrBits},"vaddr_bits":${target.vaddrBits},
+  "ref_abi":"${target.refAbi}","cpu":"$cpuName","num_cores":$numCores,
+  "probes":[
+    $probeSchema
+  ]
+}
+""")
   }
   private def write(directory: String, name: String, content: String): Unit = {
     val dir = Paths.get(directory)

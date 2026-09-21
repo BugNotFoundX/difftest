@@ -16,6 +16,8 @@
 
 #include "common.h"
 #include "dut.h"
+#include <memory>
+#include <exception>
 
 
 #ifdef VERILATOR
@@ -38,12 +40,16 @@ int main(int argc, const char *argv[]) {
   common_init(argv[0]);
 
   // main simulation loop
-  auto emu = new DUT_MODEL(argc, argv);
-  while (!emu->is_finished()) {
-    emu->tick();
+  bool is_good = false;
+  try {
+    auto emu = std::make_unique<DUT_MODEL>(argc, argv);
+    while (!emu->is_finished()) {
+      emu->tick();
+    }
+    is_good = emu->is_good();
+  } catch (const std::exception &e) {
+    fprintf(stderr, "DiffTest error: %s\n", e.what());
   }
-  bool is_good = emu->is_good();
-  delete emu;
 
 #ifdef FUZZER_LIB
   stats.accumulate();

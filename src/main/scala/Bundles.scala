@@ -202,14 +202,19 @@ case class DiffSbufferEvent(val xlen: Int = 64, val lineBytes: Int = 64) extends
   override val desiredCppName: String = "sbuffer"
 }
 
-case class DiffStoreEvent(val xlen: Int = 64) extends DifftestBundle
+case class DiffStoreEvent(val xlen: Int = 64, val paddrBits: Int = 0,
+                          val dataBits: Int = 0) extends DifftestBundle
   with DifftestWithIndex
   with DifftestWithValid
 {
   Widths.checkXlen(xlen)
-  val addr   = UInt(xlen bits)
-  val data   = UInt(xlen bits)
-  val mask   = UInt((xlen / 8) bits)
+  private val addressWidth = if (paddrBits == 0) xlen else paddrBits
+  private val dataWidth = if (dataBits == 0) xlen else dataBits
+  Widths.storageBits(addressWidth)
+  require(Set(32, 64).contains(dataWidth))
+  val addr   = UInt(addressWidth bits)
+  val data   = UInt(dataWidth bits)
+  val mask   = UInt((dataWidth / 8) bits)
   override val desiredCppName: String = "store"
 }
 

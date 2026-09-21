@@ -219,22 +219,35 @@ VERILATOR_FLAGS =                   \
   -CFLAGS "$(EMU_CXXFLAGS)"         \
   -LDFLAGS "$(EMU_LDFLAGS)"         \
   -o $(abspath $(EMU))              \
-  $(VEXTRA_FLAGS)
+  $(VEXTRA_FLAGS) $(PLATFORM_VFLAGS)
 
 EMU_MK    := $(BUILD_DIR)/emu-compile/V$(EMU_TOP).mk
 EMU_DEPS  := $(SIM_VSRC) $(EMU_CXXFILES)
 EMU_HEADERS := $(shell find $(EMU_CSRC_DIR) -name "*.h")     \
                $(shell find $(SIM_CSRC_DIR) -name "*.h")     \
-               $(shell find $(DIFFTEST_CSRC_DIR) -name "*.h")
+               $(shell find $(DIFFTEST_CSRC_DIR) -name "*.h") \
+               $(wildcard $(GEN_CSRC_DIR)/*.h) $(EMU_CONFIG_DIR)/config.h
 
-$(EMU_MK): $(SIM_TOP_V) | $(EMU_DEPS)
+# Reconfigure when switches/source lists change, not just when RTL changes.
+EMU_BUILD_CONFIG := $(BUILD_DIR)/emu-build-config
+.PHONY: FORCE_EMU_CONFIG
+$(EMU_BUILD_CONFIG): FORCE_EMU_CONFIG
+	@mkdir -p $(@D)
+	@$(file >$(BUILD_DIR)/emu-build-config.tmp,$(VERILATOR_FLAGS) $(RTL_FILES) $(EMU_DEPS)) true
+	@cmp -s $@ $@.tmp || cp $@.tmp $@
+	@rm -f $@.tmp
+
+COVERAGE_TRANSFORM ?= 1
+$(EMU_MK): $(RTL_FILES) $(EMU_BUILD_CONFIG) Makefile verilator.mk | $(EMU_DEPS)
 ifeq ($(EMU_COVERAGE),1)
+ifeq ($(COVERAGE_TRANSFORM),1)
 	@python3 ./scripts/coverage/vtransform.py $(BUILD_DIR)
+endif
 endif
 	@mkdir -p $(@D)
 	@echo "\n[verilator] Generating C++ files..." >> $(TIMELOG)
 	@date -R | tee -a $(TIMELOG)
-	$(TIME_CMD) verilator $(VERILATOR_FLAGS) -Mdir $(@D) $^ $(EMU_DEPS)
+	$(TIME_CMD) verilator $(VERILATOR_FLAGS) -Mdir $(@D) $(RTL_FILES) $(EMU_DEPS)
 ifneq ($(VERILATOR_5_000),1)
 	@find -L $(BUILD_DIR) -name "VSimTop.h" | xargs sed -i 's/private/public/g'
 	@find -L $(BUILD_DIR) -name "VSimTop.h" | xargs sed -i 's/const vlSymsp/vlSymsp/g'

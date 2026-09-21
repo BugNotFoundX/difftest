@@ -167,6 +167,11 @@ inline EmuArgs parse_args(int argc, const char *argv[]) {
   while ( (o = getopt_long(argc, const_cast<char *const*>(argv),
           "-s:C:X:I:T:R:W:hi:m:b:e:F:", long_options, &long_index)) != -1) {
     switch (o) {
+      case 1:
+        // Verilator/platform plusargs remain available through commandArgs().
+        if (optarg[0] == '+') continue;
+        fprintf(stderr, "Unexpected positional argument: %s\n", optarg);
+        exit(1);
       case 0:
         switch (long_index) {
           case 0: args.snapshot_path = optarg; continue;
@@ -304,6 +309,13 @@ Emulator::Emulator(int argc, const char *argv[]):
   };
 
   args = parse_args(argc, argv);
+#ifdef DIFFTEST_CHECK_INITIAL_STATE
+  if (!args.enable_diff) throw std::runtime_error("This profile requires DiffTest");
+  if (args.snapshot_path)
+    throw std::runtime_error("Disk snapshot restore is not supported by this profile yet");
+  if (args.enable_jtag || args.enable_runahead)
+    throw std::runtime_error("This platform does not wire JTAG or runahead");
+#endif
 #ifdef ENABLE_CONSTANTIN
   void constantinLoad();
   constantinLoad();
@@ -403,8 +415,17 @@ Emulator::Emulator(int argc, const char *argv[]):
 #ifndef CONFIG_NO_DIFFTEST
   if (args.enable_diff) {
     init_goldenmem();
+#ifdef DIFFTEST_CHECK_INITIAL_STATE
+    if (simMemory->get_size() != 128 * 1024 * 1024)
+      throw std::runtime_error("The micro platform requires 128 MiB RAM");
+#endif
     size_t ref_ramsize = args.ram_size ? simMemory->get_size() : 0;
     init_nemuproxy(ref_ramsize);
+    if (args.enable_ref_trace) {
+      for (int i = 0; i < NUM_CORES; ++i)
+        if (!difftest[i]->proxy->update_config)
+          throw std::runtime_error("REF does not support debug configuration");
+    }
   }
 #endif // CONFIG_NO_DIFFTEST
 #ifdef ENABLE_RUNAHEAD
@@ -467,6 +488,7 @@ Emulator::~Emulator() {
     bool need_wakeup = trapCode != STATE_GOODTRAP && trapCode != STATE_LIMIT_EXCEEDED && trapCode != STATE_SIG;
     if (need_wakeup) {
       lightsss->wakeup_child(cycles);
+      lightsss->do_clear();
     }
     else {
       lightsss->do_clear();
@@ -474,6 +496,7 @@ Emulator::~Emulator() {
   }
 
   display_trapinfo();
+  delete lightsss;
 
 #ifndef CONFIG_NO_DIFFTEST
   stats.update(&(difftest[0]->dut));
@@ -637,7 +660,7 @@ end_single_cycle:
   cycles ++;
 }
 
-int Emulator::tick() {
+int Emulator::tick() try {
 
 #ifdef SHOW_SCREEN
   uint32_t t = uptime();
@@ -847,6 +870,12 @@ int Emulator::tick() {
   return 0;
 }
 
+catch (const std::exception &e) {
+  fprintf(stderr, "DiffTest error: %s\n", e.what());
+  trapCode = STATE_ABORT;
+  return trapCode;
+}
+
 int Emulator::is_finished() {
   return Verilated::gotFinish() || trapCode != STATE_RUNNING;
 }
@@ -999,12 +1028,12 @@ void Emulator::snapshot_save(const char *filename) {
   stream.unbuf_write(&cycleCnt, sizeof(cycleCnt));
 
   auto proxy = diff->proxy;
-  stream.unbuf_write(&proxy->regs_int, sizeof(proxy->regs_int));
+  stream.unbuf_write(&proxy->state.regs_int, sizeof(proxy->state.regs_int));
 #ifdef CONFIG_DIFFTEST_ARCHFPREGSTATE
-  stream.unbuf_write(&proxy->regs_fp, sizeof(proxy->regs_fp));
+  stream.unbuf_write(&proxy->state.regs_fp, sizeof(proxy->state.regs_fp));
 #endif // CONFIG_DIFFTEST_ARCHFPREGSTATE
-  stream.unbuf_write(&proxy->csr, sizeof(proxy->csr));
-  stream.unbuf_write(&proxy->pc, sizeof(proxy->pc));
+  stream.unbuf_write(&proxy->state.csr, sizeof(proxy->state.csr));
+  stream.unbuf_write(&proxy->state.pc, sizeof(proxy->state.pc));
 
   char *buf = (char *)mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
   proxy->ref_memcpy(PMEM_BASE, buf, size, REF_TO_DUT);
@@ -1044,13 +1073,13 @@ void Emulator::snapshot_load(const char *filename) {
   stream.read(cycleCnt, sizeof(*cycleCnt));
 
   auto proxy = diff->proxy;
-  stream.read(&proxy->regs_int, sizeof(proxy->regs_int));
+  stream.read(&proxy->state.regs_int, sizeof(proxy->state.regs_int));
 #ifdef CONFIG_DIFFTEST_ARCHFPREGSTATE
-  stream.read(&proxy->regs_fp, sizeof(proxy->regs_fp));
+  stream.read(&proxy->state.regs_fp, sizeof(proxy->state.regs_fp));
 #endif // CONFIG_DIFFTEST_ARCHFPREGSTATE
-  stream.read(&proxy->csr, sizeof(proxy->csr));
-  stream.read(&proxy->pc, sizeof(proxy->pc));
-  proxy->ref_regcpy(&proxy->regs_int, DUT_TO_REF, false);
+  stream.read(&proxy->state.csr, sizeof(proxy->state.csr));
+  stream.read(&proxy->state.pc, sizeof(proxy->state.pc));
+  proxy->copy_state(&proxy->state, DUT_TO_REF, false);
 
   char *buf = (char *)mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
   stream.read(buf, size);

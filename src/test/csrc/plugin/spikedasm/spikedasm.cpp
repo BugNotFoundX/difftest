@@ -20,7 +20,8 @@
 
 int test_spike()
 {
-  return system("echo \"DASM(deadbeef)\" | spike-dasm > /dev/null");
+  static const int status = system("echo \"DASM(deadbeef)\" | spike-dasm > /dev/null 2>&1");
+  return status;
 }
 
 void execute_cmd(const char *cmd, char *result)

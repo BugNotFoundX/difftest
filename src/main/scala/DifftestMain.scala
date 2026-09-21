@@ -47,7 +47,9 @@ class DifftestTop(val xlen: Int = 64, val flen: Int = 64, val vlen: Int = 128,
       probe.coreid := core
     }
   }
-  DifftestModule.finish("GENERIC")
+  DifftestModule.finish("GENERIC", target =
+    if (xlen == 64 && flen == 64) DifftestTarget.legacyRV64(flen)
+    else DifftestTarget(s"riscv$xlen", xlen, flen, xlen, xlen, "none"))
 }
 
 object DifftestMain {

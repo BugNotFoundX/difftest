@@ -19,6 +19,10 @@
 
 #include <sys/types.h>
 #include "common.h"
+#include "sim-status.h"
+#if defined(DIFFTEST_CHECK_INITIAL_STATE) && defined(VM_SAVABLE)
+#error "Integer profiles need REF store-queue and checker-state snapshot serialization before EMU_SNAPSHOT=1"
+#endif
 #include "dut.h"
 #include "lightsss.h"
 #include "snapshot.h"
@@ -79,18 +83,6 @@ struct EmuArgs {
   bool image_as_footprints = false;
 };
 
-enum {
-  STATE_GOODTRAP = 0,
-  STATE_BADTRAP = 1,
-  STATE_ABORT = 2,
-  STATE_LIMIT_EXCEEDED = 3,
-  STATE_SIG = 4,
-  STATE_AMBIGUOUS = 5,
-  STATE_SIM_EXIT = 6,
-  STATE_FUZZ_COND = 7,
-  STATE_RUNNING = -1
-};
-
 class Emulator final : public DUT {
 private:
   VSimTop *dut_ptr;
@@ -145,7 +137,11 @@ public:
 #ifdef FUZZING
     return !(trapCode == STATE_ABORT);
 #else
+#ifdef DIFFTEST_CHECK_INITIAL_STATE
+    return trapCode == STATE_GOODTRAP;
+#else
     return trapCode == STATE_GOODTRAP || trapCode == STATE_LIMIT_EXCEEDED;
+#endif
 #endif
   };
   int get_trapcode() { return trapCode; }
