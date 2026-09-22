@@ -18,6 +18,25 @@ package difftest
 
 import spinal.core._
 
+/** 探针定义。
+  *
+  * 每个 case class 是一种 DiffTest 探针。**命名即契约**，改名字必须同步改
+  * `src/test/csrc/` 下的 C++：
+  *   - 类名决定生成的 Verilog 模块名与 `CONFIG_DIFFTEST_*` 宏（`Diff<X>` → `Difftest<X>`，
+  *     见 [[DifftestBundle.desiredModuleName]]）；
+  *   - 字段名决定 Verilog 端口名 `io_<字段名>` 与 C++ 结构体成员名；
+  *   - [[DifftestBundle.desiredCppName]] 决定 `DiffTestState` 里的成员名；
+  *   - [[DifftestBundle.desiredOffset]] 决定成员顺序，属 ABI。
+  *
+  * `desiredOffset` 的取值：`regs_int`=0、`csr`=1、`regs_fp`=2、`regs_vec`=4、`vcsr`=5，
+  * 其余默认 999（排在最后）。顺序变了，已有的 DiffTrace 就不能再回放。
+  *
+  * 参数的默认位宽对应各 CPU 的典型配置。本仓库（micro 流程）只用
+  * [[DiffInstrCommit]]、[[DiffArchIntRegState]]、[[DiffStoreEvent]]、[[DiffArchEvent]]
+  * 与 [[DiffTrapEvent]]；其余供其他 CPU 模型使用，不是死代码。
+  */
+
+/** 架构异常探针：每核恰好实例化一个，核数由它数出（见 [[DifftestBundle.isUniqueIdentifier]]）。 */
 case class DiffArchEvent(val xlen: Int = 64) extends DifftestBundle
   with DifftestWithValid
 {
@@ -32,6 +51,11 @@ case class DiffArchEvent(val xlen: Int = 64) extends DifftestBundle
   override val desiredCppName: String = "event"
 }
 
+/** 指令提交探针。
+  *
+  * `numPhyRegs` 决定物理目的寄存器号 `wpdest` 的位宽；`robIdxBits`/`lqIdxBits`/`sqIdxBits`
+  * 必须分别容得下 ROB 与访存队列的索引。`wdest` 是 8 位架构寄存器号。
+  */
 case class DiffInstrCommit(val numPhyRegs: Int = 32, val xlen: Int = 64,
                       val robIdxBits: Int = 10, val lqIdxBits: Int = 7, val sqIdxBits: Int = 7) extends DifftestBundle
   with DifftestWithIndex
@@ -67,6 +91,7 @@ case class DiffInstrCommit(val numPhyRegs: Int = 32, val xlen: Int = 64,
   override val desiredCppName: String = "commit"
 }
 
+/** 退出/停机探针：报告是否停机、退出码以及周期与指令计数。 */
 case class DiffTrapEvent(val xlen: Int = 64) extends DifftestBundle {
   Widths.checkXlen(xlen)
   val hasTrap  = Bool()
@@ -132,6 +157,7 @@ case class DiffFpWriteback(val numElements: Int = 32, val flen: Int = 64) extend
   override val needFlatten: Boolean = true
 }
 
+/** 32 个整数架构寄存器快照，`value(i)` 对应 x<i>；每个核一个。 */
 case class DiffArchIntRegState(val xlen: Int = 64) extends DifftestBundle {
   Widths.checkXlen(xlen)
   val value = Vec(UInt(xlen bits), 32)
@@ -139,6 +165,7 @@ case class DiffArchIntRegState(val xlen: Int = 64) extends DifftestBundle {
   override val desiredOffset: Int = 0
 }
 
+/** 延迟更新的架构状态（每核 `numElements` 槽）：`data` 是值，`nack` 表示该槽未确认。 */
 abstract class DiffArchDelayedUpdate(val numElements: Int, val dataBits: Int) extends DifftestBundle(numElements)
   with DifftestWithIndex
   with DifftestWithValid
@@ -149,6 +176,7 @@ abstract class DiffArchDelayedUpdate(val numElements: Int, val dataBits: Int) ex
   val nack = Bool()
 }
 
+// 派生探针必须显式 clone：Spinal 按运行期类型复制 Bundle，基类的实现会丢掉参数。
 case class DiffArchIntDelayedUpdate(val xlen: Int = 64, val numRegs: Int = 32)
   extends DiffArchDelayedUpdate(numRegs, xlen) {
   override val desiredCppName: String = "regs_int_delayed"
@@ -202,6 +230,11 @@ case class DiffSbufferEvent(val xlen: Int = 64, val lineBytes: Int = 64) extends
   override val desiredCppName: String = "sbuffer"
 }
 
+/** 已退休的 store：地址、数据与按字节展开的掩码。
+  *
+  * `paddrBits`/`dataBits` 传 0 表示沿用 `xlen`；`dataBits` 只支持 32 或 64，
+  * 掩码宽度随之是 4 或 8 位。
+  */
 case class DiffStoreEvent(val xlen: Int = 64, val paddrBits: Int = 0,
                           val dataBits: Int = 0) extends DifftestBundle
   with DifftestWithIndex

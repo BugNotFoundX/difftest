@@ -12,6 +12,17 @@ case class DifftestTarget(isa: String, xlen: Int, flen: Int,
   require(refAbi != "nemu-rv32-v2" || (isa == "riscv32" && flen == 0))
   require(refAbi != "nemu-rv64-v2" || (isa == "riscv64" && flen == 0))
 
+  /** 检查已登记的探针与本目标是否自洽。规则：
+    *
+    * | 探针 | 要求 |
+    * | --- | --- |
+    * | `DiffArchIntRegState`／`DiffInstrCommit`／`DiffArchEvent`／`DiffTrapEvent`／`DiffIntWriteback` | XLEN 一致 |
+    * | `DiffCSRState` | RISC-V 且 XLEN 一致 |
+    * | `DiffArchFpRegState`／`DiffFpWriteback` | FLEN 一致，且 FLEN 不为 0 时必须有 FP 寄存器快照 |
+    * | `DiffStoreEvent` | 地址位宽等于 `paddrBits` |
+    * | `nemu-rv32/64-v2` | 只支持 GPR/PC 类架构探针，禁止 CSR、向量与 LR/SC |
+    * | `legacy-rv64` | 必须带 CSR 块 |
+    */
   private[difftest] def validate(probes: Seq[DifftestBundle]): Unit = {
     probes.foreach {
       case p: DiffArchIntRegState => require(p.xlen == xlen, "GPR/XLEN mismatch")
@@ -35,6 +46,7 @@ case class DifftestTarget(isa: String, xlen: Int, flen: Int,
       "legacy-rv64 requires the legacy CSR block")
   }
 
+  /** 写进 `diffstate.h` 的平台宏，同时参与 schema 指纹的计算。 */
   private[difftest] def macros: String = Seq(
     "#define DIFFTEST_SCHEMA_VERSION 1",
     s"#define DIFFTEST_ISA_${isa.toUpperCase} 1",
@@ -47,8 +59,10 @@ case class DifftestTarget(isa: String, xlen: Int, flen: Int,
 }
 
 object DifftestTarget {
+  /** 本仓库 micro 流程使用：RV32IM、无浮点、NEMU v2 REF。 */
   val MicroRV32: DifftestTarget = DifftestTarget("riscv32", 32, 0, 32, 32, "nemu-rv32-v2")
   val MicroRV64: DifftestTarget = DifftestTarget("riscv64", 64, 0, 32, 64, "nemu-rv64-v2")
+
   def micro(xlen: Int): DifftestTarget = xlen match {
     case 32 => MicroRV32
     case 64 => MicroRV64

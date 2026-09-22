@@ -19,6 +19,12 @@ package difftest
 import spinal.core._
 import java.nio.file.Paths
 
+/** 生成/lint 用的通用顶层：不是 CPU，而是把所有探针类型都实例化一遍来压生成器。
+  *
+  * 每个核例化全部 24 种探针（见下面的 `probes`），端口名是 `core<N>_<探针名>`，
+  * 用来检查布局、位宽与 DPI 声明在完整组合下是否自洽。生产流程（micro）不用它，
+  * 它由 `src/test/scala/MigrationSpec.scala` 驱动。
+  */
 class DifftestTop(val xlen: Int = 64, val flen: Int = 64, val vlen: Int = 128,
                   val numPhyRegs: Int = 32, val numCores: Int = 1) extends Component {
   Widths.checkXlen(xlen)
@@ -53,8 +59,11 @@ class DifftestTop(val xlen: Int = 64, val flen: Int = 64, val vlen: Int = 128,
 }
 
 object DifftestMain {
+  /** 生成参数；默认值对应 RV64 全功能配置。 */
   case class Options(targetDir: String = "build", xlen: Int = 64, flen: Int = 64,
                      vlen: Int = 128, numPhyRegs: Int = 32, numCores: Int = 1)
+
+  /** 逐个消费 `--选项 值`，未识别的项直接报错。 */
   def parse(args: List[String], options: Options = Options()): Options = args match {
     case Nil => options
     case ("--target-dir" | "-td") :: value :: tail => parse(tail, options.copy(targetDir = value))
@@ -65,6 +74,7 @@ object DifftestMain {
     case "--num-cores" :: value :: tail => parse(tail, options.copy(numCores = value.toInt))
     case other => throw new IllegalArgumentException(s"Unknown or incomplete option: ${other.mkString(" ")}")
   }
+  /** 生成 `DifftestTop.sv` 与 `generated-src/` 下的全部 DiffTest 头文件。 */
   def generate(options: Options): SpinalReport[DifftestTop] = {
     val directory = Paths.get(options.targetDir).toAbsolutePath.normalize.toString
     SpinalConfig(targetDirectory = directory,
