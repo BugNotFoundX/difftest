@@ -189,7 +189,9 @@ int Difftest::step() {
     return 0;
   }
 
+#ifndef DIFFTEST_CHECK_INITIAL_STATE
   proxy->sync();
+#endif
 
   if (num_commit > 0) {
     state->record_group(dut.commit[0].pc, num_commit);
@@ -375,6 +377,19 @@ int Difftest::do_instr_commit(int i) {
 
   // single step exec
   proxy->execute(1);
+#ifdef DIFFTEST_CHECK_INITIAL_STATE
+  // Each port describes the next instruction, including intermediate WAW values.
+  proxy->sync();
+#ifdef CONFIG_DIFFTEST_INTWRITEBACK
+  if (dut.commit[i].rfwen && dut.commit[i].wdest &&
+      proxy->read_arch_reg(dut.commit[i].wdest, false) != get_commit_data(i)) {
+    Info("Commit[%d] pc=0x%lx x%d: DUT=0x%lx REF=0x%lx\n", i,
+         uint64_t(dut.commit[i].pc), int(dut.commit[i].wdest), get_commit_data(i),
+         proxy->read_arch_reg(dut.commit[i].wdest, false));
+    throw std::runtime_error("Committed integer result differs from REF");
+  }
+#endif
+#endif
   // when there's a fused instruction, let proxy execute more instructions.
   for (int j = 0; j < dut.commit[i].nFused; j++) {
     proxy->execute(1);
