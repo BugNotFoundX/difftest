@@ -7,10 +7,11 @@ case class DifftestTarget(isa: String, xlen: Int, flen: Int,
   require(xlen == (if (isa == "riscv64") 64 else 32), "ISA/XLEN mismatch")
   require(Set(0, 32, 64).contains(flen), "FLEN must be 0, 32 or 64")
   require(paddrBits > 0 && paddrBits <= 64 && vaddrBits > 0 && vaddrBits <= xlen)
-  require(Set("legacy-rv64", "nemu-rv32-v2", "nemu-rv64-v2", "none").contains(refAbi))
+  require(Set("legacy-rv64", "nemu-rv32-v2", "nemu-rv64-v2", "nemu-rv64gc", "none").contains(refAbi))
   require(refAbi != "legacy-rv64" || (isa == "riscv64" && flen != 32))
   require(refAbi != "nemu-rv32-v2" || (isa == "riscv32" && flen == 0))
   require(refAbi != "nemu-rv64-v2" || (isa == "riscv64" && flen == 0))
+  require(refAbi != "nemu-rv64gc" || (isa == "riscv64" && flen == 64))
 
   /** 检查已登记的探针与本目标是否自洽。规则：
     *
@@ -44,6 +45,13 @@ case class DifftestTarget(isa: String, xlen: Int, flen: Int,
     }
     if (refAbi == "legacy-rv64") require(probes.exists(_.isInstanceOf[DiffCSRState]),
       "legacy-rv64 requires the legacy CSR block")
+    if (refAbi == "nemu-rv64gc") {
+      require(probes.exists(_.isInstanceOf[DiffCSRState]) && probes.exists(_.isInstanceOf[DiffFCSRState]),
+        "nemu-rv64gc requires privileged CSR and floating-point CSR snapshots")
+      require(!probes.exists(p => p.isInstanceOf[DiffArchVecRegState] || p.isInstanceOf[DiffVecCSRState]),
+        "nemu-rv64gc does not include vector state")
+    } else require(!probes.exists(_.isInstanceOf[DiffFCSRState]),
+      "floating-point CSR snapshot requires the nemu-rv64gc ABI")
   }
 
   /** 写进 `diffstate.h` 的平台宏，同时参与 schema 指纹的计算。 */
@@ -59,6 +67,10 @@ case class DifftestTarget(isa: String, xlen: Int, flen: Int,
 }
 
 object DifftestTarget {
+  /** RV64GC/Sv39 reference with checked NEMU state layout, including FCSR. */
+  def VexiiRV64GC(paddrBits: Int = 32): DifftestTarget =
+    DifftestTarget("riscv64", 64, 64, paddrBits, 39, "nemu-rv64gc")
+
   /** 本仓库 micro 流程使用：RV32IM、无浮点、NEMU v2 REF。 */
   val MicroRV32: DifftestTarget = DifftestTarget("riscv32", 32, 0, 32, 32, "nemu-rv32-v2")
   val MicroRV64: DifftestTarget = DifftestTarget("riscv64", 64, 0, 32, 64, "nemu-rv64-v2")

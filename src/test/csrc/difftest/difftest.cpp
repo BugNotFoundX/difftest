@@ -34,7 +34,7 @@ int difftest_init() {
 int init_nemuproxy(size_t ramsize = 0) {
   for (int i = 0; i < NUM_CORES; i++) {
     difftest[i]->update_nemuproxy(i, ramsize);
-#ifdef DIFFTEST_CHECK_INITIAL_STATE
+#if defined(DIFFTEST_CHECK_INITIAL_STATE) || defined(DIFFTEST_CHECK_RV64GC)
     difftest[i]->initialize_reference();
 #endif
   }
@@ -199,9 +199,11 @@ int Difftest::step() {
 
   // FIXME: the following code is dirty
 #ifdef CONFIG_DIFFTEST_CSRSTATE
+#ifndef DIFFTEST_CHECK_RV64GC
   if (dut.csr.mip != proxy->state.csr.mip) {  // Ignore difftest for MIP
     proxy->state.csr.mip = dut.csr.mip;
   }
+#endif
 #endif
 
   if (apply_delayed_writeback()) {
@@ -228,6 +230,10 @@ int Difftest::step() {
 
 void Difftest::do_interrupt() {
   proxy->require_legacy("interrupts");
+#ifdef DIFFTEST_CHECK_RV64GC
+  if (dut.event.exceptionPC != proxy->state.pc)
+    throw std::runtime_error("Interrupt PC differs from REF");
+#endif
   state->record_interrupt(dut.event.exceptionPC, dut.event.exceptionInst, dut.event.interrupt);
   proxy->raise_intr(dut.event.interrupt | (1ULL << (DIFFTEST_XLEN - 1)));
   progress = true;
@@ -235,9 +241,14 @@ void Difftest::do_interrupt() {
 
 void Difftest::do_exception() {
   proxy->require_legacy("exceptions");
+#ifdef DIFFTEST_CHECK_RV64GC
+  if (dut.event.exceptionPC != proxy->state.pc)
+    throw std::runtime_error("Exception PC differs from REF");
+#endif
 #ifdef CONFIG_DIFFTEST_CSRSTATE
   state->record_exception(dut.event.exceptionPC, dut.event.exceptionInst, dut.event.exception);
-  if (dut.event.exception == 12 || dut.event.exception == 13 || dut.event.exception == 15) {
+  if (proxy->backend != RefBackend::NemuRV64GC &&
+      (dut.event.exception == 12 || dut.event.exception == 13 || dut.event.exception == 15)) {
     struct ExecutionGuide guide;
     guide.force_raise_exception = true;
     guide.exception_num = dut.event.exception;
@@ -282,6 +293,10 @@ void Difftest::do_exception() {
 }
 
 int Difftest::do_instr_commit(int i) {
+#ifdef DIFFTEST_CHECK_RV64GC
+  if (dut.commit[i].pc != proxy->state.pc)
+    throw std::runtime_error("Pre-exec PC mismatch");
+#endif
 #ifdef DIFFTEST_CHECK_INITIAL_STATE
   const auto &c = dut.commit[i];
   if (c.skip || c.nFused || c.isRVC || c.fpwen || c.vecwen || c.special)
@@ -377,7 +392,7 @@ int Difftest::do_instr_commit(int i) {
 
   // single step exec
   proxy->execute(1);
-#ifdef DIFFTEST_CHECK_INITIAL_STATE
+#if defined(DIFFTEST_CHECK_INITIAL_STATE) || defined(DIFFTEST_CHECK_RV64GC)
   // Each port describes the next instruction, including intermediate WAW values.
   proxy->sync();
 #ifdef CONFIG_DIFFTEST_INTWRITEBACK
@@ -388,6 +403,11 @@ int Difftest::do_instr_commit(int i) {
          proxy->read_arch_reg(dut.commit[i].wdest, false));
     throw std::runtime_error("Committed integer result differs from REF");
   }
+#endif
+#if defined(DIFFTEST_CHECK_RV64GC) && defined(CONFIG_DIFFTEST_FPWRITEBACK)
+  if (dut.commit[i].fpwen &&
+      proxy->read_arch_reg(dut.commit[i].wdest, true) != get_commit_data(i))
+    throw std::runtime_error("Committed floating-point result differs from REF");
 #endif
 #endif
   // when there's a fused instruction, let proxy execute more instructions.
@@ -482,6 +502,10 @@ void Difftest::initialize_reference() {
   }, true);
   proxy->sync();
   proxy->state.regs_int = {};
+#ifdef DIFFTEST_CHECK_RV64GC
+  proxy->state.regs_fp = {};
+  proxy->state.fcsr = {};
+#endif
   proxy->state.pc = FIRST_INST_ADDRESS;
   proxy->copy_state(&proxy->state, DUT_TO_REF);
   has_commit = true;

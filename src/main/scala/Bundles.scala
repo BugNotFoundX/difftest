@@ -129,6 +129,16 @@ case class DiffCSRState(val xlen: Int = 64) extends DifftestBundle {
   override val desiredOffset: Int = 1
 }
 
+/** Floating-point rounding mode and accrued exceptions in the NEMU RV64GC ABI.
+  *
+  * The low eight bits contain `frm` and `fflags`; the remaining bits are zero.
+  * Keeping this separate preserves the existing eighteen-word CSR interface.
+  */
+case class DiffFCSRState() extends DifftestBundle {
+  val value = UInt(64 bits)
+  override val desiredCppName: String = "fcsr"
+}
+
 case class DiffDebugMode(val xlen: Int = 64) extends DifftestBundle {
   Widths.checkXlen(xlen)
   val debugMode = Bool()

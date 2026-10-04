@@ -262,7 +262,10 @@ public:
 protected:
   DiffTrace *difftrace = nullptr;
 
-#if defined(CPU_NUTSHELL) || defined(CPU_ROCKET_CHIP) || defined(CPU_WINDRISE)
+#if defined(DIFFTEST_CHECK_RV64GC)
+  const uint64_t firstCommit_limit = 15000;
+  const uint64_t stuck_limit = 15000;
+#elif defined(CPU_NUTSHELL) || defined(CPU_ROCKET_CHIP) || defined(CPU_WINDRISE)
   const uint64_t firstCommit_limit = 1000;
   const uint64_t stuck_limit = 500;
 #elif defined(CPU_XIANGSHAN)

@@ -43,6 +43,9 @@ struct RefState {
 #ifdef CONFIG_DIFFTEST_VECCSRSTATE
   DifftestVecCSRState vcsr;
 #endif
+#ifdef CONFIG_DIFFTEST_FCSRSTATE
+  DifftestFCSRState fcsr;
+#endif
 };
 static_assert(std::is_standard_layout_v<RefState> && std::is_trivially_copyable_v<RefState>);
 static_assert(offsetof(RefState, regs_int) == 0);
@@ -66,9 +69,17 @@ static_assert(sizeof(RefState) == 408 && offsetof(RefState, pc) == 400,
               "integer NEMU RV64 v2 wire layout mismatch");
 #endif
 
-enum class RefBackend { LegacyRV64, NemuRV32V2, NemuRV64V2, Unavailable };
+#ifdef DIFFTEST_REF_ABI_NEMU_RV64GC
+static_assert(sizeof(RefState) == 672 && offsetof(RefState, csr) == 512 &&
+              offsetof(RefState, pc) == 656 && offsetof(RefState, fcsr) == 664,
+              "RV64GC NEMU requires GPR, FPR, 18 CSR words, PC and FCSR");
+#endif
+
+enum class RefBackend { LegacyRV64, NemuRV32V2, NemuRV64V2, NemuRV64GC, Unavailable };
 constexpr RefBackend default_ref_backend =
-#if defined(DIFFTEST_REF_ABI_NEMU_RV32_V2)
+#if defined(DIFFTEST_REF_ABI_NEMU_RV64GC)
+  RefBackend::NemuRV64GC;
+#elif defined(DIFFTEST_REF_ABI_NEMU_RV32_V2)
   RefBackend::NemuRV32V2;
 #elif defined(DIFFTEST_REF_ABI_NEMU_RV64_V2)
   RefBackend::NemuRV64V2;

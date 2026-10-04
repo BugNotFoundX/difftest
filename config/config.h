@@ -39,10 +39,16 @@
 // emulated memory size (Byte)
 #ifdef CPU_WINDRISE
 #define DEFAULT_EMU_RAM_SIZE (128 * 1024 * 1024UL)
-// Platform policy, independent of the reference register-transfer ABI.
+// The integer-only checks do not apply to the full privileged RV64GC target.
+#ifndef DIFFTEST_REF_ABI_NEMU_RV64GC
 #define DIFFTEST_CHECK_INITIAL_STATE
+#endif
 #else
 #define DEFAULT_EMU_RAM_SIZE (8 * 1024 * 1024 * 1024UL) // 8 GB
+#endif
+
+#ifdef DIFFTEST_REF_ABI_NEMU_RV64GC
+#define DIFFTEST_CHECK_RV64GC
 #endif
 
 // physical memory base address

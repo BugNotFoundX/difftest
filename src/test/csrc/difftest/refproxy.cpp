@@ -57,7 +57,8 @@ AbstractRefProxy::AbstractRefProxy(int coreid, size_t ram_size, const char *env,
 #define LoadRefFunc(this_func, ref_func, ret, ...)  this_func = GetRefFunc(, ref_func, ret, __VA_ARGS__);
 #define CheckRefFunc(this_func, ref_func, ret, ...) check_and_assert(this_func);
 
-  if ((backend == RefBackend::NemuRV32V2 || backend == RefBackend::NemuRV64V2)) {
+  if (backend == RefBackend::NemuRV32V2 || backend == RefBackend::NemuRV64V2 ||
+      backend == RefBackend::NemuRV64GC) {
 #ifdef LINKED_REFPROXY_LIB
     throw std::runtime_error("The NEMU v2 backend currently requires a dynamically loaded REF");
 #else
@@ -79,6 +80,13 @@ AbstractRefProxy::AbstractRefProxy(int coreid, size_t ram_size, const char *env,
     update_config = load_function<void (*)(void *)>("update_dynamic_config");
     ref_csrcpy = load_function<void (*)(void *, bool)>("difftest_csrcpy");
     ref_reg_display = load_function<void (*)()>("difftest_display");
+    if (backend == RefBackend::NemuRV64GC) {
+      raise_intr = load_function<void (*)(uint64_t)>("difftest_raise_intr");
+      uarchstatus_sync = load_function<void (*)(void *)>("difftest_uarchstatus_sync");
+      check_and_assert(raise_intr);
+      check_and_assert(uarchstatus_sync);
+      check_and_assert(ref_csrcpy);
+    }
     ref_set_ramsize = load_function<void (*)(size_t)>("difftest_set_ramsize");
     if (ram_size) {
       check_and_assert(ref_set_ramsize);
@@ -122,13 +130,14 @@ void AbstractRefProxy::check_status() const {
 }
 
 void AbstractRefProxy::copy_state(void *state, bool to_ref, bool legacy_restore) {
-  if ((backend == RefBackend::NemuRV32V2 || backend == RefBackend::NemuRV64V2)) ref_regcpy_v2(state, to_ref);
+  if (backend == RefBackend::NemuRV32V2 || backend == RefBackend::NemuRV64V2 ||
+      backend == RefBackend::NemuRV64GC) ref_regcpy_v2(state, to_ref);
   else ref_regcpy(state, to_ref, legacy_restore);
   check_status();
 }
 
 void AbstractRefProxy::require_legacy(const char *operation) const {
-  if (backend != RefBackend::LegacyRV64)
+  if (backend != RefBackend::LegacyRV64 && backend != RefBackend::NemuRV64GC)
     throw std::runtime_error(std::string("REF profile does not support ") + operation);
 }
 
@@ -194,6 +203,9 @@ void RefProxy::regcpy(DiffTestState *dut) {
 #ifdef CONFIG_DIFFTEST_CSRSTATE
   state.csr = dut->csr;
 #endif
+#ifdef CONFIG_DIFFTEST_FCSRSTATE
+  state.fcsr = dut->fcsr;
+#endif
   state.pc = dut->commit[0].pc;
 #ifdef CONFIG_DIFFTEST_ARCHVECREGSTATE
   state.regs_vec = dut->regs_vec;
@@ -218,6 +230,9 @@ int RefProxy::compare(DiffTestState *dut) {
 #ifdef CONFIG_DIFFTEST_VECCSRSTATE
     PROXY_COMPARE(vcsr),
 #endif // CONFIG_DIFFTEST_VECCSRSTATE
+#ifdef CONFIG_DIFFTEST_FCSRSTATE
+    PROXY_COMPARE(fcsr),
+#endif
 #ifdef CONFIG_DIFFTEST_CSRSTATE
     PROXY_COMPARE(csr)
 #endif
@@ -276,6 +291,10 @@ do {                                                                  \
 #endif // CONFIG_DIFFTEST_ARCHFPREGSTATE
 #ifdef CONFIG_DIFFTEST_CSRSTATE
     display_words(&dut->csr, &state.csr, regs_name_csr, 18, dut->commit[0].pc, sizeof(diff_int_t));
+#endif
+#ifdef CONFIG_DIFFTEST_FCSRSTATE
+    const char *fcsr_name[] = {"fcsr"};
+    display_words(&dut->fcsr, &state.fcsr, fcsr_name, 1, dut->commit[0].pc, sizeof(uint64_t));
 #endif
 #ifdef CONFIG_DIFFTEST_ARCHVECREGSTATE
     PROXY_COMPARE_AND_DISPLAY(regs_vec, regs_name_vec)
