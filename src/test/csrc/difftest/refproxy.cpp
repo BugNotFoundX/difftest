@@ -256,6 +256,45 @@ int RefProxy::compare(DiffTestState *dut) {
   return 0;
 };
 
+#ifdef DIFFTEST_CHECK_RV64GC
+void RefProxy::synchronize_cycle_read(const DifftestInstrCommit &commit, uint64_t value) {
+  const uint32_t instruction = commit.instr;
+  const unsigned csr = instruction >> 20;
+  const unsigned operation = (instruction >> 12) & 7;
+  const unsigned source = (instruction >> 15) & 31;
+  // CSRRS/CSRRC and their immediate forms do not write when rs1/zimm is zero.
+  if ((instruction & 0x7f) != 0x73 || (csr != 0xc00 && csr != 0xb00) || source ||
+      (operation != 2 && operation != 3 && operation != 6 && operation != 7)) return;
+
+  const unsigned destination = (instruction >> 7) & 31;
+  if (!commit.valid || commit.skip || commit.isRVC || commit.nFused || commit.special ||
+      commit.fpwen || commit.vecwen || commit.wdest != destination ||
+      bool(commit.rfwen) != (destination != 0))
+    throw std::runtime_error("Invalid cycle-read commit metadata");
+  if (state.pc != commit.pc + 4)
+    throw std::runtime_error("Cycle read did not complete normally in REF");
+  if (state.csr.priviledgeMode != 3 && (state.csr.satp >> 60))
+    throw std::runtime_error("Cycle-read instruction check requires bare addressing");
+  uint32_t reference_instruction = 0;
+  ref_memcpy(commit.pc, &reference_instruction, sizeof(reference_instruction), REF_TO_DUT);
+  check_status();
+  if (reference_instruction != instruction)
+    throw std::runtime_error("Cycle-read instruction differs from REF memory");
+
+  uint64_t csrs[4096]{};
+  ref_csrcpy(csrs, REF_TO_DUT);
+  check_status();
+  // Inhibited counters are deterministic: keep comparing their readback values.
+  if (csrs[0x320] & 1) return;
+  if (destination) {
+    // Preserve the post-execution REF state, including all CSR effects. The value
+    // comes from this retirement's UOP_ID-matched writeback, not a live counter.
+    write_arch_reg(destination, value);
+    sync(true);
+  }
+}
+#endif
+
 // Copy individual scalar words instead of aliasing a struct as uint64_t[].
 static void display_words(const void *dut, const void *ref, const char *const *names,
                           size_t count, uint64_t pc, size_t width) {

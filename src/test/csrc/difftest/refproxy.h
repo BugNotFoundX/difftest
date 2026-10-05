@@ -181,6 +181,10 @@ public:
   void regcpy(DiffTestState *dut);
   int compare(DiffTestState *dut);
   void display(DiffTestState *dut = nullptr);
+#ifdef DIFFTEST_CHECK_RV64GC
+  // Called after execute(1) and sync(); only a running cycle read is synchronized.
+  void synchronize_cycle_read(const DifftestInstrCommit &commit, uint64_t value);
+#endif
 
   inline void skip_one(bool isRVC, bool wen, uint32_t wdest, uint64_t wdata) {
     require_legacy("instruction skip");

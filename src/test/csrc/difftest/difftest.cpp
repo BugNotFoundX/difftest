@@ -395,6 +395,9 @@ int Difftest::do_instr_commit(int i) {
 #if defined(DIFFTEST_CHECK_INITIAL_STATE) || defined(DIFFTEST_CHECK_RV64GC)
   // Each port describes the next instruction, including intermediate WAW values.
   proxy->sync();
+#ifdef DIFFTEST_CHECK_RV64GC
+  proxy->synchronize_cycle_read(dut.commit[i], get_commit_data(i));
+#endif
 #ifdef CONFIG_DIFFTEST_INTWRITEBACK
   if (dut.commit[i].rfwen && dut.commit[i].wdest &&
       proxy->read_arch_reg(dut.commit[i].wdest, false) != get_commit_data(i)) {
