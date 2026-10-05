@@ -21,7 +21,7 @@ class Rv64GcSpec extends AnyFunSuite {
       DifftestModule(DiffTrapEvent(64), dontCare = true)
       DifftestModule(DiffStoreEvent(64, 32, 64), dontCare = true)
       DifftestModule(DiffLrScEvent(), dontCare = true)
-      DifftestModule.finish("Windrise", target = DifftestTarget.VexiiRV64GC())
+      DifftestModule.finish("Windrise", target = DifftestTarget.MicroRV64GC())
     })
     val generated = directory.resolve("generated-src")
     val schema = new String(Files.readAllBytes(generated.resolve("difftest-schema.json")), UTF_8)
@@ -47,7 +47,7 @@ class Rv64GcSpec extends AnyFunSuite {
         DifftestModule(DiffArchEvent(64), dontCare = true)
         DifftestModule(DiffArchFpRegState(64), dontCare = true)
         DifftestModule(DiffCSRState(64), dontCare = true)
-        DifftestModule.finish("Windrise", target = DifftestTarget.VexiiRV64GC())
+        DifftestModule.finish("Windrise", target = DifftestTarget.MicroRV64GC())
       })
     }
     assert(error.getMessage.contains("floating-point CSR snapshots"))

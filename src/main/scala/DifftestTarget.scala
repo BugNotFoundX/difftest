@@ -68,7 +68,7 @@ case class DifftestTarget(isa: String, xlen: Int, flen: Int,
 
 object DifftestTarget {
   /** RV64GC/Sv39 reference with checked NEMU state layout, including FCSR. */
-  def VexiiRV64GC(paddrBits: Int = 32): DifftestTarget =
+  def MicroRV64GC(paddrBits: Int = 32): DifftestTarget =
     DifftestTarget("riscv64", 64, 64, paddrBits, 39, "nemu-rv64gc")
 
   /** 本仓库 micro 流程使用：RV32IM、无浮点、NEMU v2 REF。 */
