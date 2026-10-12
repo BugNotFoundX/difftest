@@ -34,7 +34,7 @@ int difftest_init() {
 int init_nemuproxy(size_t ramsize = 0) {
   for (int i = 0; i < NUM_CORES; i++) {
     difftest[i]->update_nemuproxy(i, ramsize);
-#if defined(DIFFTEST_CHECK_INITIAL_STATE) || defined(DIFFTEST_CHECK_RV64GC)
+#if defined(DIFFTEST_CHECK_INITIAL_STATE) || defined(DIFFTEST_CHECK_PRIVILEGED)
     difftest[i]->initialize_reference();
 #endif
   }
@@ -103,11 +103,13 @@ int Difftest::step() {
 #ifdef DIFFTEST_CHECK_INITIAL_STATE
   if (dut.event.valid || dut.trap.hasWFI)
     throw std::runtime_error("Integer profile rejects exception/interrupt/WFI");
+#endif
+#ifdef DIFFTEST_CHECK_INTEGER_METADATA
   unsigned stores = 0;
   for (const auto &s : dut.store) stores += s.valid;
-  if (stores != unsigned(expected_store))
+  if (stores != expected_stores)
     throw std::runtime_error("Missing or extra retired store probe");
-  expected_store = false;
+  expected_stores = 0;
 #endif
   progress = false;
   ticks++;
@@ -199,7 +201,7 @@ int Difftest::step() {
 
   // FIXME: the following code is dirty
 #ifdef CONFIG_DIFFTEST_CSRSTATE
-#ifndef DIFFTEST_CHECK_RV64GC
+#ifndef DIFFTEST_CHECK_PRIVILEGED
   if (dut.csr.mip != proxy->state.csr.mip) {  // Ignore difftest for MIP
     proxy->state.csr.mip = dut.csr.mip;
   }
@@ -230,7 +232,7 @@ int Difftest::step() {
 
 void Difftest::do_interrupt() {
   proxy->require_legacy("interrupts");
-#ifdef DIFFTEST_CHECK_RV64GC
+#ifdef DIFFTEST_CHECK_PRIVILEGED
   if (dut.event.exceptionPC != proxy->state.pc)
     throw std::runtime_error("Interrupt PC differs from REF");
 #endif
@@ -241,13 +243,13 @@ void Difftest::do_interrupt() {
 
 void Difftest::do_exception() {
   proxy->require_legacy("exceptions");
-#ifdef DIFFTEST_CHECK_RV64GC
+#ifdef DIFFTEST_CHECK_PRIVILEGED
   if (dut.event.exceptionPC != proxy->state.pc)
     throw std::runtime_error("Exception PC differs from REF");
 #endif
 #ifdef CONFIG_DIFFTEST_CSRSTATE
   state->record_exception(dut.event.exceptionPC, dut.event.exceptionInst, dut.event.exception);
-  if (proxy->backend != RefBackend::NemuRV64GC &&
+  if (proxy->backend == RefBackend::LegacyRV64 &&
       (dut.event.exception == 12 || dut.event.exception == 13 || dut.event.exception == 15)) {
     struct ExecutionGuide guide;
     guide.force_raise_exception = true;
@@ -293,11 +295,11 @@ void Difftest::do_exception() {
 }
 
 int Difftest::do_instr_commit(int i) {
-#ifdef DIFFTEST_CHECK_RV64GC
+#ifdef DIFFTEST_CHECK_PRIVILEGED
   if (dut.commit[i].pc != proxy->state.pc)
     throw std::runtime_error("Pre-exec PC mismatch");
 #endif
-#ifdef DIFFTEST_CHECK_INITIAL_STATE
+#ifdef DIFFTEST_CHECK_INTEGER_METADATA
   const auto &c = dut.commit[i];
   if (c.skip || c.nFused || c.isRVC || c.fpwen || c.vecwen || c.special)
     throw std::runtime_error("Unsupported commit flags");
@@ -307,17 +309,33 @@ int Difftest::do_instr_commit(int i) {
     case 0x63: case 0x67: case 0x6f: case 0x0f: break;
 #if DIFFTEST_XLEN == 64
     case 0x1b: case 0x3b: break;
+    case 0x73: {
+#ifndef CONFIG_DIFFTEST_CSRSTATE
+      const unsigned funct3 = (c.instr >> 12) & 7;
+      // Initial OoO Zicsr coverage: mscratch readback is compared through GPRs.
+      // Privileged state, counters and SYSTEM instructions need their own probes.
+      if ((c.instr >> 20) != 0x340 || funct3 == 0 || funct3 == 4)
+        throw std::runtime_error("CSR outside the integer test profile");
+#endif
+      break;
+    }
 #endif
     default: throw std::runtime_error("Instruction outside the integer test profile");
   }
   if (bool(c.isStore) != (opcode == 0x23) || bool(c.isLoad) != (opcode == 0x03))
     throw std::runtime_error("Invalid load/store commit metadata");
   if (c.pc != proxy->state.pc) throw std::runtime_error("Pre-exec PC mismatch");
-  uint32_t instr = 0;
-  proxy->ref_memcpy(c.pc, &instr, sizeof(instr), REF_TO_DUT);
-  proxy->check_status();
-  if (instr != c.instr) throw std::runtime_error("Instruction bytes differ from REF memory");
-  expected_store = c.isStore;
+  // ref_memcpy addresses physical memory; virtual execution is checked by REF stepping.
+#ifdef CONFIG_DIFFTEST_CSRSTATE
+  if (proxy->state.csr.priviledgeMode == 3 || !(proxy->state.csr.satp >> 60))
+#endif
+  {
+    uint32_t instr = 0;
+    proxy->ref_memcpy(c.pc, &instr, sizeof(instr), REF_TO_DUT);
+    proxy->check_status();
+    if (instr != c.instr) throw std::runtime_error("Instruction bytes differ from REF memory");
+  }
+  expected_stores += c.isStore;
 #endif
 
   // store the writeback info to debug array
@@ -392,10 +410,10 @@ int Difftest::do_instr_commit(int i) {
 
   // single step exec
   proxy->execute(1);
-#if defined(DIFFTEST_CHECK_INITIAL_STATE) || defined(DIFFTEST_CHECK_RV64GC)
+#if defined(DIFFTEST_CHECK_INITIAL_STATE) || defined(DIFFTEST_CHECK_PRIVILEGED)
   // Each port describes the next instruction, including intermediate WAW values.
   proxy->sync();
-#ifdef DIFFTEST_CHECK_RV64GC
+#ifdef DIFFTEST_CHECK_PRIVILEGED
   proxy->synchronize_cycle_read(dut.commit[i], get_commit_data(i));
 #endif
 #ifdef CONFIG_DIFFTEST_INTWRITEBACK
@@ -407,7 +425,7 @@ int Difftest::do_instr_commit(int i) {
     throw std::runtime_error("Committed integer result differs from REF");
   }
 #endif
-#if defined(DIFFTEST_CHECK_RV64GC) && defined(CONFIG_DIFFTEST_FPWRITEBACK)
+#if defined(DIFFTEST_CHECK_PRIVILEGED) && defined(CONFIG_DIFFTEST_FPWRITEBACK)
   if (dut.commit[i].fpwen &&
       proxy->read_arch_reg(dut.commit[i].wdest, true) != get_commit_data(i))
     throw std::runtime_error("Committed floating-point result differs from REF");
@@ -505,8 +523,10 @@ void Difftest::initialize_reference() {
   }, true);
   proxy->sync();
   proxy->state.regs_int = {};
-#ifdef DIFFTEST_CHECK_RV64GC
+#ifdef CONFIG_DIFFTEST_ARCHFPREGSTATE
   proxy->state.regs_fp = {};
+#endif
+#ifdef CONFIG_DIFFTEST_FCSRSTATE
   proxy->state.fcsr = {};
 #endif
   proxy->state.pc = FIRST_INST_ADDRESS;

@@ -181,7 +181,7 @@ public:
   void regcpy(DiffTestState *dut);
   int compare(DiffTestState *dut);
   void display(DiffTestState *dut = nullptr);
-#ifdef DIFFTEST_CHECK_RV64GC
+#ifdef DIFFTEST_CHECK_PRIVILEGED
   // Called after execute(1) and sync(); only a running cycle read is synchronized.
   void synchronize_cycle_read(const DifftestInstrCommit &commit, uint64_t value);
 #endif

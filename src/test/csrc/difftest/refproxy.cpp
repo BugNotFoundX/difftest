@@ -80,7 +80,11 @@ AbstractRefProxy::AbstractRefProxy(int coreid, size_t ram_size, const char *env,
     update_config = load_function<void (*)(void *)>("update_dynamic_config");
     ref_csrcpy = load_function<void (*)(void *, bool)>("difftest_csrcpy");
     ref_reg_display = load_function<void (*)()>("difftest_display");
-    if (backend == RefBackend::NemuRV64GC) {
+    if (backend == RefBackend::NemuRV64GC
+#ifdef CONFIG_DIFFTEST_CSRSTATE
+        || backend == RefBackend::NemuRV64V2
+#endif
+    ) {
       raise_intr = load_function<void (*)(uint64_t)>("difftest_raise_intr");
       uarchstatus_sync = load_function<void (*)(void *)>("difftest_uarchstatus_sync");
       check_and_assert(raise_intr);
@@ -137,7 +141,11 @@ void AbstractRefProxy::copy_state(void *state, bool to_ref, bool legacy_restore)
 }
 
 void AbstractRefProxy::require_legacy(const char *operation) const {
-  if (backend != RefBackend::LegacyRV64 && backend != RefBackend::NemuRV64GC)
+  if (backend != RefBackend::LegacyRV64 && backend != RefBackend::NemuRV64GC
+#ifdef CONFIG_DIFFTEST_CSRSTATE
+      && backend != RefBackend::NemuRV64V2
+#endif
+  )
     throw std::runtime_error(std::string("REF profile does not support ") + operation);
 }
 
@@ -256,7 +264,7 @@ int RefProxy::compare(DiffTestState *dut) {
   return 0;
 };
 
-#ifdef DIFFTEST_CHECK_RV64GC
+#ifdef DIFFTEST_CHECK_PRIVILEGED
 void RefProxy::synchronize_cycle_read(const DifftestInstrCommit &commit, uint64_t value) {
   const uint32_t instruction = commit.instr;
   const unsigned csr = instruction >> 20;

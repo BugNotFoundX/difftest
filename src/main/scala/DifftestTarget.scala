@@ -21,7 +21,7 @@ case class DifftestTarget(isa: String, xlen: Int, flen: Int,
     * | `DiffCSRState` | RISC-V 且 XLEN 一致 |
     * | `DiffArchFpRegState`／`DiffFpWriteback` | FLEN 一致，且 FLEN 不为 0 时必须有 FP 寄存器快照 |
     * | `DiffStoreEvent` | 地址位宽等于 `paddrBits` |
-    * | `nemu-rv32/64-v2` | 只支持 GPR/PC 类架构探针，禁止 CSR、向量与 LR/SC |
+    * | `nemu-rv32/64-v2` | RV32 只支持 GPR/PC；RV64 可带特权 CSR，均禁止向量与 LR/SC |
     * | `legacy-rv64` | 必须带 CSR 块 |
     */
   private[difftest] def validate(probes: Seq[DifftestBundle]): Unit = {
@@ -39,7 +39,7 @@ case class DifftestTarget(isa: String, xlen: Int, flen: Int,
     }
     require(probes.exists(_.isInstanceOf[DiffArchFpRegState]) == (flen != 0), "FLEN/probe capability mismatch")
     if (Set("nemu-rv32-v2", "nemu-rv64-v2").contains(refAbi)) {
-      require(!probes.exists(p => p.isInstanceOf[DiffCSRState] ||
+      require(!probes.exists(p => (refAbi == "nemu-rv32-v2" && p.isInstanceOf[DiffCSRState]) ||
         p.isInstanceOf[DiffArchVecRegState] || p.isInstanceOf[DiffVecCSRState] ||
         p.isInstanceOf[DiffLrScEvent]), s"$refAbi supports only GPR/PC architectural probes")
     }

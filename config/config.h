@@ -39,16 +39,19 @@
 // emulated memory size (Byte)
 #ifdef CPU_WINDRISE
 #define DEFAULT_EMU_RAM_SIZE (128 * 1024 * 1024UL)
-// The integer-only checks do not apply to the full privileged RV64GC target.
-#ifndef DIFFTEST_REF_ABI_NEMU_RV64GC
+// Integer retirement metadata remains checked when CSR/exception probes are enabled.
+#if !defined(DIFFTEST_REF_ABI_NEMU_RV64GC)
+#define DIFFTEST_CHECK_INTEGER_METADATA
+#ifndef CONFIG_DIFFTEST_CSRSTATE
 #define DIFFTEST_CHECK_INITIAL_STATE
+#endif
 #endif
 #else
 #define DEFAULT_EMU_RAM_SIZE (8 * 1024 * 1024 * 1024UL) // 8 GB
 #endif
 
-#ifdef DIFFTEST_REF_ABI_NEMU_RV64GC
-#define DIFFTEST_CHECK_RV64GC
+#if defined(DIFFTEST_REF_ABI_NEMU_RV64GC) || (defined(DIFFTEST_REF_ABI_NEMU_RV64_V2) && defined(CONFIG_DIFFTEST_CSRSTATE))
+#define DIFFTEST_CHECK_PRIVILEGED
 #endif
 
 // physical memory base address

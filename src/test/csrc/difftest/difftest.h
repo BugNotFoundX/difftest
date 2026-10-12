@@ -200,8 +200,8 @@ public:
   uint32_t num_commit = 0; // # of commits if made progress
   bool has_commit = false;
   void initialize_reference();
-#ifdef DIFFTEST_CHECK_INITIAL_STATE
-  bool expected_store = false;
+#ifdef DIFFTEST_CHECK_INTEGER_METADATA
+  unsigned expected_stores = 0;
 #endif
   // Trigger a difftest checking procdure
   int step();
@@ -262,7 +262,7 @@ public:
 protected:
   DiffTrace *difftrace = nullptr;
 
-#if defined(DIFFTEST_CHECK_RV64GC)
+#if defined(DIFFTEST_CHECK_PRIVILEGED)
   const uint64_t firstCommit_limit = 15000;
   const uint64_t stuck_limit = 15000;
 #elif defined(CPU_NUTSHELL) || defined(CPU_ROCKET_CHIP) || defined(CPU_WINDRISE)
