@@ -295,12 +295,12 @@ void Difftest::do_exception() {
 }
 
 int Difftest::do_instr_commit(int i) {
+  const auto &c = dut.commit[i];
 #ifdef DIFFTEST_CHECK_PRIVILEGED
   if (dut.commit[i].pc != proxy->state.pc)
     throw std::runtime_error("Pre-exec PC mismatch");
 #endif
 #ifdef DIFFTEST_CHECK_INTEGER_METADATA
-  const auto &c = dut.commit[i];
   if (c.skip || c.nFused || c.isRVC || c.fpwen || c.vecwen || c.special)
     throw std::runtime_error("Unsupported commit flags");
   const unsigned opcode = c.instr & 0x7f;
@@ -325,17 +325,19 @@ int Difftest::do_instr_commit(int i) {
   if (bool(c.isStore) != (opcode == 0x23) || bool(c.isLoad) != (opcode == 0x03))
     throw std::runtime_error("Invalid load/store commit metadata");
   if (c.pc != proxy->state.pc) throw std::runtime_error("Pre-exec PC mismatch");
+  expected_stores += c.isStore;
+#endif
+#if defined(DIFFTEST_CHECK_INTEGER_METADATA) || defined(DIFFTEST_REF_ABI_NEMU_RV64GC)
   // ref_memcpy addresses physical memory; virtual execution is checked by REF stepping.
 #ifdef CONFIG_DIFFTEST_CSRSTATE
   if (proxy->state.csr.priviledgeMode == 3 || !(proxy->state.csr.satp >> 60))
 #endif
   {
     uint32_t instr = 0;
-    proxy->ref_memcpy(c.pc, &instr, sizeof(instr), REF_TO_DUT);
+    proxy->ref_memcpy(c.pc, &instr, c.isRVC ? 2 : sizeof(instr), REF_TO_DUT);
     proxy->check_status();
     if (instr != c.instr) throw std::runtime_error("Instruction bytes differ from REF memory");
   }
-  expected_stores += c.isStore;
 #endif
 
   // store the writeback info to debug array
