@@ -15,6 +15,7 @@
 ***************************************************************************************/
 
 #include <iostream>
+#include <climits>
 #include <sys/mman.h>
 
 #include "common.h"
@@ -26,6 +27,8 @@
 #ifdef WITH_DRAMSIM3
 #include "cosimulation.h"
 CoDRAMsim3 *dram = NULL;
+static uint64_t dram_requests[2] = {}, dram_responses[2] = {}, dram_latency[2] = {};
+static uint64_t dram_rejected = 0;
 #endif
 
 SimMemory *simMemory = nullptr;
@@ -432,8 +435,20 @@ void dramsim3_init() {
 #endif
 
   assert(dram == NULL);
-  dram = new ComplexCoDRAMsim3(DRAMSIM3_CONFIG, DRAMSIM3_OUTDIR);
-  // dram = new SimpleCoDRAMsim3(90);
+  if (const char *value = getenv("DIFFTEST_DRAM_LATENCY")) {
+    char *end;
+    long latency = strtol(value, &end, 10);
+    Assert(*value && !*end && latency > 0 && latency <= INT_MAX,
+      "DIFFTEST_DRAM_LATENCY must be a positive cycle count\n");
+    dram = new SimpleCoDRAMsim3(static_cast<int>(latency));
+  } else {
+    const char *config = getenv("DIFFTEST_DRAM_CONFIG");
+    const char *output = getenv("DIFFTEST_DRAM_OUTDIR");
+    config = config ? config : DRAMSIM3_CONFIG;
+    output = output ? output : DRAMSIM3_OUTDIR;
+    printf("DRAMsim3 config: %s (cosimulation default padding: 66 CPU cycles)\n", config);
+    dram = new ComplexCoDRAMsim3(config, output);
+  }
 }
 
 void dramsim3_step() {
@@ -441,6 +456,11 @@ void dramsim3_step() {
 }
 
 void dramsim3_finish() {
+  printf("DRAMsim3 requests: read=%lu write=%lu rejected=%lu; completions: read=%lu write=%lu\n",
+    dram_requests[0], dram_requests[1], dram_rejected, dram_responses[0], dram_responses[1]);
+  printf("DRAMsim3 mean completion latency: read=%.2f write=%.2f CPU cycles\n",
+    dram_responses[0] ? double(dram_latency[0]) / dram_responses[0] : 0.0,
+    dram_responses[1] ? double(dram_latency[1]) / dram_responses[1] : 0.0);
   delete dram;
 }
 
@@ -449,7 +469,10 @@ uint64_t memory_response(bool isWrite) {
   if (response) {
     auto meta = static_cast<dramsim3_meta *>(response->req->meta);
     uint64_t response_value = meta->id | (1UL << 32);
+    dram_responses[isWrite]++;
+    dram_latency[isWrite] += response->resp_time - response->req_time;
     delete meta;
+    delete response->req;
     delete response;
     return response_value;
   }
@@ -465,8 +488,10 @@ bool memory_request(uint64_t address, uint32_t id, bool isWrite) {
     meta->id = id;
     req->meta = meta;
     dram->add_request(req);
+    dram_requests[isWrite]++;
     return true;
   }
+  dram_rejected++;
   return false;
 }
 
